@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 from textual.widgets import DataTable
 from typer.testing import CliRunner
@@ -118,7 +119,7 @@ def test_pipeline_start_list_steps_and_failed_logs_with_moto(
     assert any("boom: validation failed" in line for line in tail_step_logs(ctx, failed_step))
 
 
-def test_pipeline_list_prints_empty_running_message(sagemaker_client):
+def test_pipeline_list_includes_recent_finished_execution(sagemaker_client):
     sagemaker_client.create_pipeline(
         PipelineName="idle-pipeline",
         RoleArn="arn:aws:iam::123456789012:role/SageMakerExecutionRole",
@@ -129,7 +130,32 @@ def test_pipeline_list_prints_empty_running_message(sagemaker_client):
     result = runner.invoke(app, ["pipeline", "list", "--name", "idle-pipeline", "--region", REGION])
 
     assert result.exit_code == 0, result.output
-    assert "没有正在运行的 pipeline executions" in result.output
+    assert "idle-pipeline" in result.output
+    assert "Succeeded" in result.output
+
+
+def test_pipeline_list_excludes_finished_execution_outside_recent_window(sagemaker_client):
+    sagemaker_client.create_pipeline(
+        PipelineName="old-pipeline",
+        RoleArn="arn:aws:iam::123456789012:role/SageMakerExecutionRole",
+        PipelineDefinition='{"Version": "2020-12-01", "Steps": []}',
+    )
+    execution_arn = sagemaker_client.start_pipeline_execution(PipelineName="old-pipeline")["PipelineExecutionArn"]
+
+    from moto.sagemaker.models import sagemaker_backends
+
+    execution = sagemaker_backends["123456789012"][REGION].pipelines["old-pipeline"].pipeline_executions[
+        execution_arn
+    ]
+    old_time = datetime.now(timezone.utc) - timedelta(hours=4)
+    execution.start_time = old_time
+    execution.last_modified_time = old_time
+    execution.creation_time = old_time
+
+    result = runner.invoke(app, ["pipeline", "list", "--name", "old-pipeline", "--region", REGION, "--hours", "3"])
+
+    assert result.exit_code == 0, result.output
+    assert "没有正在运行或最近 3 小时内结束" in result.output
 
 
 def test_build_contexts_supports_multiple_mock_profiles(aws_mock):

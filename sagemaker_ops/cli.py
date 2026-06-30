@@ -144,15 +144,18 @@ def pipeline_list(
     region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region。")] = None,
     all_profiles: Annotated[bool, typer.Option("--all-profiles", help="查看本机所有 AWS profiles。")] = False,
     per_pipeline: Annotated[int, typer.Option("--per-pipeline", min=1, max=100, help="每个 pipeline 最多读取多少个 execution。")] = 10,
+    hours: Annotated[int, typer.Option("--hours", min=1, max=168, help="额外显示最近多少小时内结束的 executions。")] = 3,
 ) -> None:
-    """用表格列出正在运行的 Pipeline executions。"""
+    """用表格列出正在运行和最近结束的 Pipeline executions。"""
     try:
         with console.status("正在查询 SageMaker Pipeline executions..."):
             contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
             executions = [
                 item
                 for ctx in contexts
-                for item in list_active_pipeline_executions(ctx, pipeline_name=pipeline_name, per_pipeline=per_pipeline)
+                for item in list_active_pipeline_executions(
+                    ctx, pipeline_name=pipeline_name, per_pipeline=per_pipeline, recent_hours=hours
+                )
             ]
     except AwsCliError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -160,7 +163,7 @@ def pipeline_list(
 
     if not executions:
         target = f"Pipeline {pipeline_name}" if pipeline_name else "当前查询范围"
-        console.print(f"[yellow]{target} 没有正在运行的 pipeline executions。[/yellow]")
+        console.print(f"[yellow]{target} 没有正在运行或最近 {hours} 小时内结束的 pipeline executions。[/yellow]")
         if not pipeline_name:
             console.print("提示：不传 --name 会扫描账号里所有 pipelines；pipeline 很多时建议加 --name 精确查询。")
         return
@@ -225,9 +228,10 @@ def tui_pipelines(
     region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region。")] = None,
     all_profiles: Annotated[bool, typer.Option("--all-profiles", help="查看本机所有 AWS profiles。")] = False,
     refresh: Annotated[int, typer.Option("--refresh", min=5, max=300, help="刷新间隔秒数。")] = 15,
+    hours: Annotated[int, typer.Option("--hours", min=1, max=168, help="额外显示最近多少小时内结束的 executions。")] = 3,
 ) -> None:
-    """交互式查看正在运行的 Pipeline executions、steps 和失败日志。"""
-    PipelineExecutionsApp(tuple(profile or ()), region, all_profiles, refresh, pipeline_name).run()
+    """交互式查看正在运行和最近结束的 Pipeline executions、steps 和失败日志。"""
+    PipelineExecutionsApp(tuple(profile or ()), region, all_profiles, refresh, pipeline_name, hours).run()
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@
 - 提交 SageMaker Processing Job
 - 启动 SageMaker Pipeline execution
 - 用 TUI 查看正在运行的 Processing Jobs
-- 用 TUI 查看正在运行的 Pipeline executions、steps 状态和失败 step 的 CloudWatch 日志尾部
+- 用 TUI 查看正在运行和最近结束的 Pipeline executions、steps 状态和失败 step 的 CloudWatch 日志尾部
 - 支持单个、多个或所有 AWS profiles
 
 ## 安装
@@ -87,6 +87,12 @@ smops tui pipelines --profile dev --region us-east-1
 smops tui pipelines --profile dev --region us-east-1 --name my-pipeline
 ```
 
+默认会显示正在运行的 executions，以及最近 3 小时内结束的 executions，方便查看成功/失败结果。可以用 `--hours` 调整窗口：
+
+```bash
+smops tui pipelines --profile dev --region us-east-1 --name my-pipeline --hours 6
+```
+
 快捷键：
 
 - `←/→` 在 executions 和 steps 面板之间切换
@@ -106,6 +112,7 @@ smops tui pipelines --profile dev --region us-east-1 --name my-pipeline
 ```bash
 smops processing list --profile dev --region us-east-1
 smops pipeline list --profile dev --region us-east-1
+smops pipeline list --profile dev --region us-east-1 --name my-pipeline --hours 6
 smops pipeline steps --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:...
 ```
 
@@ -166,7 +173,7 @@ pytest
 覆盖范围包括：
 
 - Processing Job 提交和 running job 列表
-- Pipeline execution 启动和 running execution 列表
+- Pipeline execution 启动和 active/recent execution 列表
 - Pipeline steps 状态展示
 - 失败 step 的 CloudWatch Logs tail
 - Processing Job TUI 的上下左右键导航

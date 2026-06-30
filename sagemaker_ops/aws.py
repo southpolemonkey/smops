@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -197,9 +197,11 @@ def list_active_pipeline_executions(
     ctx: AwsContext,
     pipeline_name: str | None = None,
     per_pipeline: int = 10,
+    recent_hours: int = 3,
 ) -> list[PipelineExecutionView]:
     names = [pipeline_name] if pipeline_name else _list_pipeline_names(ctx)
     executions: list[PipelineExecutionView] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=recent_hours)
 
     for name in names:
         paginator = ctx.sagemaker.get_paginator("list_pipeline_executions")
@@ -211,21 +213,52 @@ def list_active_pipeline_executions(
         ):
             for summary in page.get("PipelineExecutionSummaries", []):
                 status = summary.get("PipelineExecutionStatus", "")
-                if status not in ACTIVE_PIPELINE_STATUSES:
+                execution_arn = summary.get("PipelineExecutionArn", "")
+                detail = _describe_pipeline_execution_safely(ctx, execution_arn) if execution_arn else {}
+                start_time = detail.get("StartTime", summary.get("StartTime"))
+                last_modified_time = detail.get("LastModifiedTime", summary.get("LastModifiedTime"))
+                if not _should_show_pipeline_execution(status, start_time, last_modified_time, cutoff):
                     continue
                 executions.append(
                     PipelineExecutionView(
                         profile=ctx.profile,
                         region=ctx.region,
-                        pipeline_name=name,
-                        execution_arn=summary.get("PipelineExecutionArn", ""),
-                        display_name=summary.get("PipelineExecutionDisplayName", ""),
+                        pipeline_name=detail.get("PipelineName", name),
+                        execution_arn=execution_arn,
+                        display_name=summary.get("PipelineExecutionDisplayName", detail.get("PipelineExecutionDisplayName", "")),
                         status=status,
-                        start_time=summary.get("StartTime"),
-                        last_modified_time=summary.get("LastModifiedTime"),
+                        start_time=start_time,
+                        last_modified_time=last_modified_time,
                     )
                 )
-    return sorted(executions, key=lambda item: item.start_time or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return sorted(
+        executions,
+        key=lambda item: item.last_modified_time or item.start_time or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+
+def _describe_pipeline_execution_safely(ctx: AwsContext, execution_arn: str) -> dict[str, Any]:
+    try:
+        return ctx.sagemaker.describe_pipeline_execution(PipelineExecutionArn=execution_arn)
+    except (BotoCoreError, ClientError):
+        return {}
+
+
+def _should_show_pipeline_execution(
+    status: str,
+    start_time: datetime | None,
+    last_modified_time: datetime | None,
+    cutoff: datetime,
+) -> bool:
+    if status in ACTIVE_PIPELINE_STATUSES:
+        return True
+    recent_at = last_modified_time or start_time
+    if recent_at is None:
+        return False
+    if recent_at.tzinfo is None:
+        recent_at = recent_at.replace(tzinfo=timezone.utc)
+    return recent_at >= cutoff
 
 
 def list_pipeline_steps(ctx: AwsContext, execution_arn: str) -> list[dict[str, Any]]:

@@ -215,9 +215,11 @@ class PipelineExecutionsApp(BaseSageMakerApp):
         all_profiles: bool,
         refresh_seconds: int,
         pipeline_name: str | None,
+        recent_hours: int = 3,
     ) -> None:
         super().__init__(profiles, region, all_profiles, refresh_seconds)
         self.pipeline_name = pipeline_name
+        self.recent_hours = recent_hours
         self.executions: list[tuple[AwsContext, PipelineExecutionView]] = []
         self.steps: list[dict[str, Any]] = []
         self.selected_context: AwsContext | None = None
@@ -248,12 +250,14 @@ class PipelineExecutionsApp(BaseSageMakerApp):
         try:
             pairs: list[tuple[AwsContext, PipelineExecutionView]] = []
             for ctx in self.load_contexts():
-                for execution in list_active_pipeline_executions(ctx, pipeline_name=self.pipeline_name):
+                for execution in list_active_pipeline_executions(
+                    ctx, pipeline_name=self.pipeline_name, recent_hours=self.recent_hours
+                ):
                     pairs.append((ctx, execution))
             self.executions = pairs
             self.render_executions()
             self.query_one("#status", Static).update(
-                f"{len(self.executions)} running pipeline execution(s). "
+                f"{len(self.executions)} active/recent pipeline execution(s), window={self.recent_hours}h. "
                 "Use left/right to switch panes, arrows to move, l to load failed-step logs."
             )
         except AwsCliError as exc:
@@ -301,7 +305,7 @@ class PipelineExecutionsApp(BaseSageMakerApp):
         logs.clear()
         if index is None or index >= len(self.executions):
             self.query_one("#steps", DataTable).clear()
-            logs.write("No running pipeline executions.")
+            logs.write(f"No active or recent pipeline executions in the last {self.recent_hours}h.")
             return
 
         ctx, execution = self.executions[index]
