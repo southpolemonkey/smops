@@ -264,8 +264,6 @@ def tail_cloudwatch_logs(
         streams = ctx.logs.describe_log_streams(
             logGroupName=log_group,
             logStreamNamePrefix=stream_prefix,
-            orderBy="LastEventTime",
-            descending=True,
             limit=5,
         ).get("logStreams", [])
     except ctx.logs.exceptions.ResourceNotFoundException:
@@ -273,6 +271,7 @@ def tail_cloudwatch_logs(
     except (BotoCoreError, ClientError) as exc:
         return [f"读取日志流失败: {exc}"]
 
+    streams = sorted(streams, key=lambda stream: stream.get("lastEventTimestamp", 0), reverse=True)
     lines: list[str] = []
     for stream in streams:
         stream_name = stream["logStreamName"]

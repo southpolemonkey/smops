@@ -153,3 +153,24 @@ smops tui processing --profile mock-dev
 ```
 
 注意：这套 credentials 是 dummy 值，只适合 dry-run、mock、本地端点或配合 botocore Stubber/moto 使用；直接访问真实 AWS 会认证失败。
+
+## E2E 测试
+
+测试使用 `moto` 模拟 AWS SageMaker 和 CloudWatch Logs，不会访问真实 AWS：
+
+```bash
+pip install -e '.[dev]'
+pytest
+```
+
+覆盖范围包括：
+
+- Processing Job 提交和 running job 列表
+- Pipeline execution 启动和 running execution 列表
+- Pipeline steps 状态展示
+- 失败 step 的 CloudWatch Logs tail
+- Processing Job TUI 的上下左右键导航
+- Pipeline TUI 的 executions、steps 和失败日志加载
+- 多 AWS profile 解析
+
+Moto 目前还没有实现 `list_pipeline_execution_steps`，测试里对这一个 paginator 做了内存 fake，其余 SageMaker/Logs 调用都在 moto 环境中执行。

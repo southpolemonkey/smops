@@ -83,11 +83,16 @@ def processing_list(
 ) -> None:
     """用表格列出正在运行的 Processing Jobs。"""
     try:
-        contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
-        jobs = [job for ctx in contexts for job in list_processing_jobs(ctx, max_results=max_results)]
+        with console.status("正在查询 SageMaker Processing Jobs..."):
+            contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
+            jobs = [job for ctx in contexts for job in list_processing_jobs(ctx, max_results=max_results)]
     except AwsCliError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
+
+    if not jobs:
+        console.print("[yellow]当前查询范围没有正在运行的 processing jobs。[/yellow]")
+        return
 
     table = Table("Profile", "Region", "Job", "Status", "Runtime", "Instance", "Created")
     for job in jobs:
@@ -142,15 +147,23 @@ def pipeline_list(
 ) -> None:
     """用表格列出正在运行的 Pipeline executions。"""
     try:
-        contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
-        executions = [
-            item
-            for ctx in contexts
-            for item in list_active_pipeline_executions(ctx, pipeline_name=pipeline_name, per_pipeline=per_pipeline)
-        ]
+        with console.status("正在查询 SageMaker Pipeline executions..."):
+            contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
+            executions = [
+                item
+                for ctx in contexts
+                for item in list_active_pipeline_executions(ctx, pipeline_name=pipeline_name, per_pipeline=per_pipeline)
+            ]
     except AwsCliError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
+
+    if not executions:
+        target = f"Pipeline {pipeline_name}" if pipeline_name else "当前查询范围"
+        console.print(f"[yellow]{target} 没有正在运行的 pipeline executions。[/yellow]")
+        if not pipeline_name:
+            console.print("提示：不传 --name 会扫描账号里所有 pipelines；pipeline 很多时建议加 --name 精确查询。")
+        return
 
     table = Table("Profile", "Region", "Pipeline", "Execution", "Status", "Runtime", "Started")
     for execution in executions:

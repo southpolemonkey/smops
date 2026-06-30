@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from textual import on
+from textual.binding import Binding
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header, RichLog, Static
@@ -96,8 +97,10 @@ class BaseSageMakerApp(App[None]):
 class ProcessingJobsApp(BaseSageMakerApp):
     TITLE = "SageMaker Processing Jobs"
     BINDINGS = BaseSageMakerApp.BINDINGS + [
-        ("left", "previous_job", "Previous"),
-        ("right", "next_job", "Next"),
+        Binding("left", "previous_job", "Previous", priority=True),
+        Binding("up", "previous_job", "Previous", priority=True),
+        Binding("right", "next_job", "Next", priority=True),
+        Binding("down", "next_job", "Next", priority=True),
     ]
 
     def __init__(
