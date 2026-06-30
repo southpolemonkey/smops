@@ -116,6 +116,13 @@ smops pipeline list --profile dev --region us-east-1 --name my-pipeline --hours 
 smops pipeline steps --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:...
 ```
 
+`processing list` 默认每页读取 20 个 running jobs。输出 `Next token` 时，用它继续翻页：
+
+```bash
+smops processing list --profile dev --region us-east-1 --max-results 20
+smops processing list --profile dev --region us-east-1 --max-results 20 --next-token '<token>'
+```
+
 ## AWS 权限
 
 运行账号需要至少具备这些权限：
@@ -172,7 +179,7 @@ pytest
 
 覆盖范围包括：
 
-- Processing Job 提交和 running job 列表
+- Processing Job 提交和 running job 分页列表
 - Pipeline execution 启动和 active/recent execution 列表
 - Pipeline steps 状态展示
 - 失败 step 的 CloudWatch Logs tail

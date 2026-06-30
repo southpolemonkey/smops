@@ -18,6 +18,7 @@ from sagemaker_ops.aws import (
     list_active_pipeline_executions,
     list_pipeline_steps,
     list_processing_jobs,
+    list_processing_jobs_page,
     load_job_spec,
     parse_parameters,
     start_pipeline_execution,
@@ -79,13 +80,17 @@ def processing_list(
     profile: Annotated[list[str] | None, typer.Option("--profile", "-p", help="AWS profile，可重复传。")] = None,
     region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region。")] = None,
     all_profiles: Annotated[bool, typer.Option("--all-profiles", help="查看本机所有 AWS profiles。")] = False,
-    max_results: Annotated[int, typer.Option("--max-results", min=1, max=1000, help="每个 profile 最多读取多少个 running job。")] = 50,
+    max_results: Annotated[int, typer.Option("--max-results", min=1, max=100, help="每页最多读取多少个 running job。")] = 20,
+    next_token: Annotated[str | None, typer.Option("--next-token", help="上一页输出的 Next token。")] = None,
 ) -> None:
-    """用表格列出正在运行的 Processing Jobs。"""
+    """按页列出正在运行的 Processing Jobs。"""
     try:
         with console.status("正在查询 SageMaker Processing Jobs..."):
             contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
-            jobs = [job for ctx in contexts for job in list_processing_jobs(ctx, max_results=max_results)]
+            if next_token and len(contexts) != 1:
+                raise AwsCliError("--next-token 只支持单个 AWS profile 查询")
+            pages = [list_processing_jobs_page(ctx, page_size=max_results, next_token=next_token) for ctx in contexts]
+            jobs = [job for page in pages for job in page.jobs]
     except AwsCliError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
@@ -109,6 +114,9 @@ def processing_list(
             format_dt(job.creation_time),
         )
     console.print(table)
+    next_tokens = [page.next_token for page in pages if page.next_token]
+    if next_tokens:
+        console.print(f"Next token: {next_tokens[0]}")
 
 
 @pipeline_app.command("start")

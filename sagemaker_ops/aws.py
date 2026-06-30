@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -41,6 +43,12 @@ class ProcessingJobView:
     role_arn: str
     failure_reason: str
     arn: str
+
+
+@dataclass(frozen=True)
+class ProcessingJobsPage:
+    jobs: list[ProcessingJobView]
+    next_token: str | None
 
 
 @dataclass(frozen=True)
@@ -151,46 +159,91 @@ def start_pipeline_execution(
 
 
 def list_processing_jobs(ctx: AwsContext, max_results: int = 50) -> list[ProcessingJobView]:
-    summaries: list[dict[str, Any]] = []
-    for status in ACTIVE_PROCESSING_STATUSES:
-        paginator = ctx.sagemaker.get_paginator("list_processing_jobs")
-        for page in paginator.paginate(
-            StatusEquals=status,
-            SortBy="CreationTime",
-            SortOrder="Descending",
-            PaginationConfig={"PageSize": min(max_results, 100), "MaxItems": max_results},
-        ):
-            summaries.extend(page.get("ProcessingJobSummaries", []))
+    return list_processing_jobs_page(ctx, page_size=max_results).jobs
 
-    jobs: list[ProcessingJobView] = []
-    for summary in summaries:
-        name = summary["ProcessingJobName"]
+
+def list_processing_jobs_page(
+    ctx: AwsContext,
+    page_size: int = 20,
+    next_token: str | None = None,
+) -> ProcessingJobsPage:
+    page_size = max(1, min(page_size, 100))
+    status_index, aws_next_token = _decode_processing_jobs_token(next_token)
+    summaries: list[dict[str, Any]] = []
+    output_next_token: str | None = None
+
+    while len(summaries) < page_size and status_index < len(ACTIVE_PROCESSING_STATUSES):
+        status = ACTIVE_PROCESSING_STATUSES[status_index]
+        request: dict[str, Any] = {
+            "StatusEquals": status,
+            "SortBy": "CreationTime",
+            "SortOrder": "Descending",
+            "MaxResults": min(100, page_size - len(summaries)),
+        }
+        if aws_next_token:
+            request["NextToken"] = aws_next_token
+
         try:
-            detail = ctx.sagemaker.describe_processing_job(ProcessingJobName=name)
-        except (BotoCoreError, ClientError):
-            detail = summary
-        cluster = (
-            detail.get("ProcessingResources", {})
-            .get("ClusterConfig", {})
-        )
-        jobs.append(
-            ProcessingJobView(
-                profile=ctx.profile,
-                region=ctx.region,
-                name=name,
-                status=detail.get("ProcessingJobStatus", summary.get("ProcessingJobStatus", "")),
-                creation_time=detail.get("CreationTime", summary.get("CreationTime")),
-                last_modified_time=detail.get("LastModifiedTime"),
-                started_time=detail.get("ProcessingStartTime"),
-                ended_time=detail.get("ProcessingEndTime"),
-                instance_type=cluster.get("InstanceType", ""),
-                instance_count=cluster.get("InstanceCount"),
-                role_arn=detail.get("RoleArn", ""),
-                failure_reason=detail.get("FailureReason", ""),
-                arn=detail.get("ProcessingJobArn", summary.get("ProcessingJobArn", "")),
-            )
-        )
-    return sorted(jobs, key=lambda job: job.creation_time or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+            response = ctx.sagemaker.list_processing_jobs(**request)
+        except (BotoCoreError, ClientError) as exc:
+            raise AwsCliError(f"读取 processing jobs 失败: {exc}") from exc
+
+        summaries.extend(response.get("ProcessingJobSummaries", []))
+        aws_next_token = response.get("NextToken")
+        if aws_next_token:
+            output_next_token = _encode_processing_jobs_token(status_index, aws_next_token)
+            break
+        status_index += 1
+
+    jobs = [_processing_job_view_from_summary(ctx, summary) for summary in summaries]
+    return ProcessingJobsPage(
+        jobs=sorted(jobs, key=lambda job: job.creation_time or datetime.min.replace(tzinfo=timezone.utc), reverse=True),
+        next_token=output_next_token,
+    )
+
+
+def _processing_job_view_from_summary(ctx: AwsContext, summary: dict[str, Any]) -> ProcessingJobView:
+    name = summary["ProcessingJobName"]
+    try:
+        detail = ctx.sagemaker.describe_processing_job(ProcessingJobName=name)
+    except (BotoCoreError, ClientError):
+        detail = summary
+    cluster = detail.get("ProcessingResources", {}).get("ClusterConfig", {})
+    return ProcessingJobView(
+        profile=ctx.profile,
+        region=ctx.region,
+        name=name,
+        status=detail.get("ProcessingJobStatus", summary.get("ProcessingJobStatus", "")),
+        creation_time=detail.get("CreationTime", summary.get("CreationTime")),
+        last_modified_time=detail.get("LastModifiedTime"),
+        started_time=detail.get("ProcessingStartTime"),
+        ended_time=detail.get("ProcessingEndTime"),
+        instance_type=cluster.get("InstanceType", ""),
+        instance_count=cluster.get("InstanceCount"),
+        role_arn=detail.get("RoleArn", ""),
+        failure_reason=detail.get("FailureReason", ""),
+        arn=detail.get("ProcessingJobArn", summary.get("ProcessingJobArn", "")),
+    )
+
+
+def _encode_processing_jobs_token(status_index: int, aws_next_token: str) -> str:
+    payload = json.dumps({"status_index": status_index, "aws_next_token": aws_next_token}).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _decode_processing_jobs_token(next_token: str | None) -> tuple[int, str | None]:
+    if not next_token:
+        return 0, None
+    try:
+        decoded = base64.urlsafe_b64decode(next_token.encode("ascii"))
+        payload = json.loads(decoded.decode("utf-8"))
+        status_index = int(payload.get("status_index", 0))
+        aws_next_token = payload.get("aws_next_token")
+    except (binascii.Error, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise AwsCliError("processing jobs next token 无效") from exc
+    if status_index < 0 or status_index >= len(ACTIVE_PROCESSING_STATUSES) or not isinstance(aws_next_token, str):
+        raise AwsCliError("processing jobs next token 无效")
+    return status_index, aws_next_token
 
 
 def list_active_pipeline_executions(

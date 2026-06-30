@@ -13,6 +13,7 @@ from sagemaker_ops.aws import (
     list_active_pipeline_executions,
     list_pipeline_steps,
     list_processing_jobs,
+    list_processing_jobs_page,
     tail_step_logs,
 )
 from sagemaker_ops.cli import app
@@ -56,6 +57,29 @@ def test_processing_submit_and_running_list_cli_with_moto(processing_spec, sagem
     assert list_result.exit_code == 0, list_result.output
     assert "running-processing" in list_result.output
     assert "InProgress" in list_result.output
+
+
+def test_processing_list_paginates_running_jobs(sagemaker_client, logs_client):
+    create_active_processing_job(sagemaker_client, "running-processing-a")
+    create_active_processing_job(sagemaker_client, "running-processing-b")
+    ctx = context_with_steps(sagemaker_client, logs_client, "unused")
+
+    first_page = list_processing_jobs_page(ctx, page_size=1)
+
+    assert len(first_page.jobs) == 1
+    assert first_page.next_token
+
+    second_page = list_processing_jobs_page(ctx, page_size=1, next_token=first_page.next_token)
+
+    assert len(second_page.jobs) == 1
+    assert {first_page.jobs[0].name, second_page.jobs[0].name} == {
+        "running-processing-a",
+        "running-processing-b",
+    }
+
+    cli_first_page = runner.invoke(app, ["processing", "list", "--region", REGION, "--max-results", "1"])
+    assert cli_first_page.exit_code == 0, cli_first_page.output
+    assert "Next token:" in cli_first_page.output
 
 
 def test_pipeline_start_list_steps_and_failed_logs_with_moto(
