@@ -1,0 +1,7 @@
+[profile mock-dev]
+region = us-east-1
+output = json
+
+[profile mock-prod]
+region = us-west-2
+output = json

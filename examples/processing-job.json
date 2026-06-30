@@ -1,0 +1,17 @@
+{
+  "ProcessingJobName": "example-processing-job",
+  "RoleArn": "arn:aws:iam::123456789012:role/SageMakerExecutionRole",
+  "AppSpecification": {
+    "ImageUri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-processing-image:latest"
+  },
+  "ProcessingResources": {
+    "ClusterConfig": {
+      "InstanceCount": 1,
+      "InstanceType": "ml.m5.xlarge",
+      "VolumeSizeInGB": 30
+    }
+  },
+  "StoppingCondition": {
+    "MaxRuntimeInSeconds": 3600
+  }
+}
