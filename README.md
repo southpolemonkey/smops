@@ -123,6 +123,13 @@ smops processing list --profile dev --region us-east-1 --max-results 20
 smops processing list --profile dev --region us-east-1 --max-results 20 --next-token '<token>'
 ```
 
+`pipeline list` 不传 `--name` 时默认每页只扫描 10 个 pipelines，避免真实账号里 pipelines 很多时卡住。输出 `Next token` 时，用它继续翻页：
+
+```bash
+smops pipeline list --profile dev --region us-east-1 --pipeline-page-size 10
+smops pipeline list --profile dev --region us-east-1 --pipeline-page-size 10 --next-token '<token>'
+```
+
 ## AWS 权限
 
 运行账号需要至少具备这些权限：

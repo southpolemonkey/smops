@@ -11,6 +11,7 @@ import sagemaker_ops.tui as tui_module
 from sagemaker_ops.aws import (
     build_contexts,
     list_active_pipeline_executions,
+    list_pipeline_executions_page,
     list_pipeline_steps,
     list_processing_jobs,
     list_processing_jobs_page,
@@ -156,6 +157,34 @@ def test_pipeline_list_includes_recent_finished_execution(sagemaker_client):
     assert result.exit_code == 0, result.output
     assert "idle-pipeline" in result.output
     assert "Succeeded" in result.output
+
+
+def test_pipeline_list_paginates_pipeline_names_without_name(sagemaker_client, logs_client):
+    for name in ["paged-pipeline-a", "paged-pipeline-b"]:
+        sagemaker_client.create_pipeline(
+            PipelineName=name,
+            RoleArn="arn:aws:iam::123456789012:role/SageMakerExecutionRole",
+            PipelineDefinition='{"Version": "2020-12-01", "Steps": []}',
+        )
+        sagemaker_client.start_pipeline_execution(PipelineName=name)
+    ctx = context_with_steps(sagemaker_client, logs_client, "unused")
+
+    first_page = list_pipeline_executions_page(ctx, pipeline_page_size=1)
+
+    assert len(first_page.executions) == 1
+    assert first_page.next_token
+
+    second_page = list_pipeline_executions_page(ctx, pipeline_page_size=1, next_token=first_page.next_token)
+
+    assert len(second_page.executions) == 1
+    assert {first_page.executions[0].pipeline_name, second_page.executions[0].pipeline_name} == {
+        "paged-pipeline-a",
+        "paged-pipeline-b",
+    }
+
+    cli_first_page = runner.invoke(app, ["pipeline", "list", "--region", REGION, "--pipeline-page-size", "1"])
+    assert cli_first_page.exit_code == 0, cli_first_page.output
+    assert "Next token:" in cli_first_page.output
 
 
 def test_pipeline_list_excludes_finished_execution_outside_recent_window(sagemaker_client):

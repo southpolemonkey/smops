@@ -63,6 +63,12 @@ class PipelineExecutionView:
     last_modified_time: datetime | None
 
 
+@dataclass(frozen=True)
+class PipelineExecutionsPage:
+    executions: list[PipelineExecutionView]
+    next_token: str | None
+
+
 def load_job_spec(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise AwsCliError(f"配置文件不存在: {path}")
@@ -252,43 +258,110 @@ def list_active_pipeline_executions(
     per_pipeline: int = 10,
     recent_hours: int = 3,
 ) -> list[PipelineExecutionView]:
-    names = [pipeline_name] if pipeline_name else _list_pipeline_names(ctx)
-    executions: list[PipelineExecutionView] = []
+    return list_pipeline_executions_page(
+        ctx,
+        pipeline_name=pipeline_name,
+        per_pipeline=per_pipeline,
+        recent_hours=recent_hours,
+    ).executions
+
+
+def list_pipeline_executions_page(
+    ctx: AwsContext,
+    pipeline_name: str | None = None,
+    per_pipeline: int = 10,
+    recent_hours: int = 3,
+    pipeline_page_size: int = 10,
+    next_token: str | None = None,
+) -> PipelineExecutionsPage:
+    names, output_next_token = _list_pipeline_names_page(
+        ctx,
+        pipeline_name=pipeline_name,
+        page_size=pipeline_page_size,
+        next_token=next_token,
+    )
     cutoff = datetime.now(timezone.utc) - timedelta(hours=recent_hours)
+    executions: list[PipelineExecutionView] = []
 
     for name in names:
-        paginator = ctx.sagemaker.get_paginator("list_pipeline_executions")
-        for page in paginator.paginate(
-            PipelineName=name,
-            SortBy="CreationTime",
-            SortOrder="Descending",
-            PaginationConfig={"PageSize": min(per_pipeline, 100), "MaxItems": per_pipeline},
-        ):
-            for summary in page.get("PipelineExecutionSummaries", []):
-                status = summary.get("PipelineExecutionStatus", "")
-                execution_arn = summary.get("PipelineExecutionArn", "")
-                detail = _describe_pipeline_execution_safely(ctx, execution_arn) if execution_arn else {}
-                start_time = detail.get("StartTime", summary.get("StartTime"))
-                last_modified_time = detail.get("LastModifiedTime", summary.get("LastModifiedTime"))
-                if not _should_show_pipeline_execution(status, start_time, last_modified_time, cutoff):
-                    continue
-                executions.append(
-                    PipelineExecutionView(
-                        profile=ctx.profile,
-                        region=ctx.region,
-                        pipeline_name=detail.get("PipelineName", name),
-                        execution_arn=execution_arn,
-                        display_name=summary.get("PipelineExecutionDisplayName", detail.get("PipelineExecutionDisplayName", "")),
-                        status=status,
-                        start_time=start_time,
-                        last_modified_time=last_modified_time,
-                    )
-                )
-    return sorted(
-        executions,
-        key=lambda item: item.last_modified_time or item.start_time or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True,
+        executions.extend(_list_recent_pipeline_executions_for_name(ctx, name, per_pipeline, cutoff))
+
+    return PipelineExecutionsPage(
+        executions=sorted(
+            executions,
+            key=lambda item: item.last_modified_time or item.start_time or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        ),
+        next_token=output_next_token,
     )
+
+
+def _list_recent_pipeline_executions_for_name(
+    ctx: AwsContext,
+    pipeline_name: str,
+    per_pipeline: int,
+    cutoff: datetime,
+) -> list[PipelineExecutionView]:
+    request = {
+        "PipelineName": pipeline_name,
+        "SortBy": "CreationTime",
+        "SortOrder": "Descending",
+        "MaxResults": max(1, min(per_pipeline, 100)),
+    }
+    try:
+        response = ctx.sagemaker.list_pipeline_executions(**request)
+    except (BotoCoreError, ClientError) as exc:
+        raise AwsCliError(f"读取 pipeline executions 失败 pipeline={pipeline_name}: {exc}") from exc
+
+    executions: list[PipelineExecutionView] = []
+    for summary in response.get("PipelineExecutionSummaries", []):
+        status = summary.get("PipelineExecutionStatus", "")
+        execution_arn = summary.get("PipelineExecutionArn", "")
+        detail = _describe_pipeline_execution_safely(ctx, execution_arn) if execution_arn else {}
+        start_time = detail.get("StartTime", summary.get("StartTime"))
+        last_modified_time = detail.get("LastModifiedTime", summary.get("LastModifiedTime"))
+        if not _should_show_pipeline_execution(status, start_time, last_modified_time, cutoff):
+            continue
+        executions.append(
+            PipelineExecutionView(
+                profile=ctx.profile,
+                region=ctx.region,
+                pipeline_name=detail.get("PipelineName", pipeline_name),
+                execution_arn=execution_arn,
+                display_name=summary.get("PipelineExecutionDisplayName", detail.get("PipelineExecutionDisplayName", "")),
+                status=status,
+                start_time=start_time,
+                last_modified_time=last_modified_time,
+            )
+        )
+    return executions
+
+
+def _list_pipeline_names_page(
+    ctx: AwsContext,
+    pipeline_name: str | None,
+    page_size: int,
+    next_token: str | None,
+) -> tuple[list[str], str | None]:
+    if pipeline_name:
+        if next_token:
+            raise AwsCliError("指定 --name 时不支持 pipeline next token")
+        return [pipeline_name], None
+
+    request: dict[str, Any] = {
+        "SortBy": "CreationTime",
+        "SortOrder": "Descending",
+        "MaxResults": max(1, min(page_size, 100)),
+    }
+    if next_token:
+        request["NextToken"] = next_token
+    try:
+        response = ctx.sagemaker.list_pipelines(**request)
+    except (BotoCoreError, ClientError) as exc:
+        raise AwsCliError(f"读取 pipelines 失败: {exc}") from exc
+
+    names = [item["PipelineName"] for item in response.get("PipelineSummaries", [])]
+    return names, response.get("NextToken")
 
 
 def _describe_pipeline_execution_safely(ctx: AwsContext, execution_arn: str) -> dict[str, Any]:

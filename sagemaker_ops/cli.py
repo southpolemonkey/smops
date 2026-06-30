@@ -16,6 +16,7 @@ from sagemaker_ops.aws import (
     format_dt,
     format_duration,
     list_active_pipeline_executions,
+    list_pipeline_executions_page,
     list_pipeline_steps,
     list_processing_jobs,
     list_processing_jobs_page,
@@ -95,8 +96,11 @@ def processing_list(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
 
+    next_tokens = [page.next_token for page in pages if page.next_token]
     if not jobs:
         console.print("[yellow]当前查询范围没有正在运行的 processing jobs。[/yellow]")
+        if len(contexts) == 1 and next_tokens:
+            console.print(f"Next token: {next_tokens[0]}")
         return
 
     table = Table("Profile", "Region", "Job", "Status", "Runtime", "Instance", "Created")
@@ -114,8 +118,7 @@ def processing_list(
             format_dt(job.creation_time),
         )
     console.print(table)
-    next_tokens = [page.next_token for page in pages if page.next_token]
-    if next_tokens:
+    if len(contexts) == 1 and next_tokens:
         console.print(f"Next token: {next_tokens[0]}")
 
 
@@ -153,27 +156,37 @@ def pipeline_list(
     all_profiles: Annotated[bool, typer.Option("--all-profiles", help="查看本机所有 AWS profiles。")] = False,
     per_pipeline: Annotated[int, typer.Option("--per-pipeline", min=1, max=100, help="每个 pipeline 最多读取多少个 execution。")] = 10,
     hours: Annotated[int, typer.Option("--hours", min=1, max=168, help="额外显示最近多少小时内结束的 executions。")] = 3,
+    pipeline_page_size: Annotated[int, typer.Option("--pipeline-page-size", min=1, max=100, help="不传 --name 时每页扫描多少个 pipelines。")] = 10,
+    next_token: Annotated[str | None, typer.Option("--next-token", help="上一页输出的 Next token。")] = None,
 ) -> None:
     """用表格列出正在运行和最近结束的 Pipeline executions。"""
     try:
         with console.status("正在查询 SageMaker Pipeline executions..."):
             contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
-            executions = [
-                item
-                for ctx in contexts
-                for item in list_active_pipeline_executions(
-                    ctx, pipeline_name=pipeline_name, per_pipeline=per_pipeline, recent_hours=hours
+            if next_token and (len(contexts) != 1 or pipeline_name):
+                raise AwsCliError("--next-token 只支持单个 AWS profile 且不指定 --name 的查询")
+            pages = [
+                list_pipeline_executions_page(
+                    ctx,
+                    pipeline_name=pipeline_name,
+                    per_pipeline=per_pipeline,
+                    recent_hours=hours,
+                    pipeline_page_size=pipeline_page_size,
+                    next_token=next_token,
                 )
+                for ctx in contexts
             ]
+            executions = [item for page in pages for item in page.executions]
     except AwsCliError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
 
+    next_tokens = [page.next_token for page in pages if page.next_token]
     if not executions:
-        target = f"Pipeline {pipeline_name}" if pipeline_name else "当前查询范围"
+        target = f"Pipeline {pipeline_name}" if pipeline_name else "当前页"
         console.print(f"[yellow]{target} 没有正在运行或最近 {hours} 小时内结束的 pipeline executions。[/yellow]")
-        if not pipeline_name:
-            console.print("提示：不传 --name 会扫描账号里所有 pipelines；pipeline 很多时建议加 --name 精确查询。")
+        if len(contexts) == 1 and next_tokens:
+            console.print(f"Next token: {next_tokens[0]}")
         return
 
     table = Table("Profile", "Region", "Pipeline", "Execution", "Status", "Runtime", "Started")
@@ -188,6 +201,8 @@ def pipeline_list(
             format_dt(execution.start_time),
         )
     console.print(table)
+    if len(contexts) == 1 and next_tokens:
+        console.print(f"Next token: {next_tokens[0]}")
 
 
 @pipeline_app.command("steps")
