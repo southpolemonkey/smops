@@ -105,6 +105,13 @@ def parse_parameters(items: Iterable[str]) -> list[dict[str, str]]:
     return parameters
 
 
+def available_profiles() -> list[str]:
+    try:
+        return list(boto3.Session().available_profiles)
+    except BotoCoreError as exc:
+        raise AwsCliError(f"读取 AWS profiles 失败: {exc}") from exc
+
+
 def build_contexts(
     profiles: tuple[str, ...],
     region: str | None,

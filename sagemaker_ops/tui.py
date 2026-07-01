@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from textual import on
 from textual.binding import Binding
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import DataTable, Footer, Header, RichLog, Static
+from textual.screen import ModalScreen
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, RichLog, Static
 
 from sagemaker_ops.aws import (
     AwsCliError,
     AwsContext,
+    available_profiles,
     ProcessingJobView,
     PipelineExecutionView,
     build_contexts,
@@ -20,6 +23,10 @@ from sagemaker_ops.aws import (
     list_active_pipeline_executions,
     list_pipeline_steps,
     list_processing_jobs,
+    load_job_spec,
+    parse_parameters,
+    start_pipeline_execution,
+    submit_processing_job,
     tail_step_logs,
 )
 
@@ -68,10 +75,28 @@ class BaseSageMakerApp(App[None]):
     #logs-pane {
         width: 52%;
     }
+
+    .dialog {
+        width: 70;
+        height: auto;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    .dialog Input {
+        margin-bottom: 1;
+    }
+
+    #home {
+        height: 1fr;
+    }
     """
 
     BINDINGS = [
         ("r", "refresh", "Refresh"),
+        Binding("p", "switch_profile", "Profile", priority=True),
+        Binding("P", "switch_profile", "Profile", priority=True, show=False),
         ("q", "quit", "Quit"),
     ]
 
@@ -101,6 +126,48 @@ class BaseSageMakerApp(App[None]):
     def show_error(self, exc: Exception) -> None:
         self.query_one("#status", Static).update(f"[red]{exc}[/red]")
 
+    def on_key(self, event) -> None:
+        if event.key in {"p", "P"}:
+            event.stop()
+            self.action_switch_profile()
+        elif event.key == "s":
+            if isinstance(self, ProcessingJobsApp):
+                event.stop()
+                self.action_submit_processing()
+            elif isinstance(self, PipelineExecutionsApp):
+                event.stop()
+                self.action_start_pipeline()
+
+    def primary_context(self) -> AwsContext | None:
+        contexts = self.load_contexts()
+        return contexts[0] if contexts else None
+
+    def action_switch_profile(self) -> None:
+        try:
+            profiles = available_profiles()
+        except AwsCliError as exc:
+            self.show_error(exc)
+            return
+        if not profiles:
+            self.show_error(AwsCliError("No AWS profiles found."))
+            return
+        current = self.profiles[0] if self.profiles else None
+        try:
+            current_index = profiles.index(current) if current else -1
+        except ValueError:
+            current_index = -1
+        next_profile = profiles[(current_index + 1) % len(profiles)]
+        self.apply_profile(next_profile)
+
+    def apply_profile(self, profile: str | None) -> None:
+        if not profile:
+            return
+        self.profiles = (profile,)
+        self.all_profiles = False
+        self.contexts = []
+        self.query_one("#status", Static).update(f"Switched profile to {profile}.")
+        self.action_refresh()
+
 
 class ProcessingJobsApp(BaseSageMakerApp):
     TITLE = "SageMaker Processing Jobs"
@@ -109,6 +176,7 @@ class ProcessingJobsApp(BaseSageMakerApp):
         Binding("up", "previous_job", "Previous", priority=True),
         Binding("right", "next_job", "Next", priority=True),
         Binding("down", "next_job", "Next", priority=True),
+        Binding("s", "submit_processing", "Submit", priority=True),
     ]
 
     def __init__(
@@ -142,7 +210,7 @@ class ProcessingJobsApp(BaseSageMakerApp):
             self.render_jobs()
             self.query_one("#status", Static).update(
                 f"{len(self.jobs)} running processing job(s). Refresh every {self.refresh_seconds}s. "
-                "Use arrows to move, r to refresh, q to quit."
+                "Use arrows to move, P to switch profile, s to submit, r to refresh, q to quit."
             )
         except AwsCliError as exc:
             self.show_error(exc)
@@ -156,6 +224,25 @@ class ProcessingJobsApp(BaseSageMakerApp):
         table = self.query_one("#jobs", DataTable)
         if table.row_count:
             table.move_cursor(row=min(table.row_count - 1, table.cursor_row + 1))
+
+    def action_submit_processing(self) -> None:
+        self.push_screen(ProcessingSubmitScreen(), self.submit_processing_from_form)
+
+    def submit_processing_from_form(self, config_path: str | None) -> None:
+        if not config_path:
+            return
+        try:
+            ctx = self.primary_context()
+            if ctx is None:
+                raise AwsCliError("No AWS context available.")
+            spec = load_job_spec(Path(config_path).expanduser())
+            response = submit_processing_job(ctx, spec)
+            job_name = spec.get("ProcessingJobName") or response.get("ProcessingJobArn", "")
+            self.query_one("#status", Static).update(f"Submitted processing job {job_name} on {ctx.profile}/{ctx.region}.")
+            self.contexts = []
+            self.action_refresh()
+        except Exception as exc:
+            self.show_error(exc)
 
     def render_jobs(self) -> None:
         table = self.query_one("#jobs", DataTable)
@@ -214,6 +301,7 @@ class PipelineExecutionsApp(BaseSageMakerApp):
         ("left", "focus_executions", "Executions"),
         ("right", "focus_steps", "Steps"),
         ("l", "load_logs", "Logs"),
+        Binding("s", "start_pipeline", "Start", priority=True),
     ]
 
     def __init__(
@@ -276,7 +364,7 @@ class PipelineExecutionsApp(BaseSageMakerApp):
             self.render_executions(previous_execution_arn, previous_step_name, preserve_logs=True)
             self.query_one("#status", Static).update(
                 f"{len(self.executions)} active/recent pipeline execution(s), window={self.recent_hours}h. "
-                "Use left/right to switch panes, arrows to move, l to load failed-step logs."
+                "Use left/right to switch panes, P to switch profile, s to start, l to load logs."
             )
         except AwsCliError as exc:
             self.show_error(exc)
@@ -289,6 +377,35 @@ class PipelineExecutionsApp(BaseSageMakerApp):
 
     def action_load_logs(self) -> None:
         self.load_selected_step_logs()
+
+    def action_start_pipeline(self) -> None:
+        self.push_screen(PipelineStartScreen(self.pipeline_name or ""), self.start_pipeline_from_form)
+
+    def start_pipeline_from_form(self, values: dict[str, str] | None) -> None:
+        if not values:
+            return
+        try:
+            ctx = self.selected_context or self.primary_context()
+            if ctx is None:
+                raise AwsCliError("No AWS context available.")
+            pipeline_name = values.get("pipeline_name", "").strip()
+            if not pipeline_name:
+                raise AwsCliError("Pipeline name is required.")
+            response = start_pipeline_execution(
+                ctx,
+                pipeline_name=pipeline_name,
+                display_name=values.get("display_name") or None,
+                parameters=parse_parameters(_split_parameters(values.get("parameters", ""))),
+                client_request_token=None,
+            )
+            execution_arn = response.get("PipelineExecutionArn", "")
+            self.query_one("#status", Static).update(f"Started pipeline {pipeline_name} on {ctx.profile}/{ctx.region}.")
+            self.contexts = []
+            self.action_refresh()
+            if execution_arn:
+                self.render_executions(execution_arn, preserve_logs=False)
+        except Exception as exc:
+            self.show_error(exc)
 
     def render_executions(
         self,
@@ -449,6 +566,92 @@ class PipelineExecutionsApp(BaseSageMakerApp):
         if not self.selected_execution_arn or not step_name:
             return None
         return self.selected_execution_arn, step_name
+
+
+class SmopsTuiApp(App[str | None]):
+    TITLE = "smops"
+    CSS = BaseSageMakerApp.CSS
+    BINDINGS = [
+        ("q", "quit", "Quit"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("Choose a SageMaker view. Press Enter to open.", id="status")
+        table = DataTable(id="home")
+        table.cursor_type = "row"
+        yield table
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#home", DataTable)
+        table.add_columns("View", "Description")
+        table.add_row("pipelines", "Pipeline executions, steps, failed logs, start pipeline", key="pipelines")
+        table.add_row("processing", "Processing jobs, details, submit processing job", key="processing")
+        table.focus()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        self.exit(str(event.row_key.value))
+
+
+class PipelineStartScreen(ModalScreen[dict[str, str] | None]):
+    def __init__(self, pipeline_name: str = "") -> None:
+        super().__init__()
+        self.pipeline_name = pipeline_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label("Start SageMaker Pipeline")
+            yield Input(value=self.pipeline_name, placeholder="Pipeline name", id="pipeline-name")
+            yield Input(placeholder="Display name (optional)", id="display-name")
+            yield Input(placeholder="Parameters: Name=Value,Other=Value", id="parameters")
+            with Horizontal():
+                yield Button("Start", id="start", variant="primary")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#pipeline-name", Input).focus()
+
+    @on(Button.Pressed, "#start")
+    def start(self) -> None:
+        self.dismiss(
+            {
+                "pipeline_name": self.query_one("#pipeline-name", Input).value,
+                "display_name": self.query_one("#display-name", Input).value,
+                "parameters": self.query_one("#parameters", Input).value,
+            }
+        )
+
+    @on(Button.Pressed, "#cancel")
+    def cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ProcessingSubmitScreen(ModalScreen[str | None]):
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label("Submit SageMaker Processing Job")
+            yield Input(placeholder="Config path (.json/.yaml)", id="config-path")
+            with Horizontal():
+                yield Button("Submit", id="submit", variant="primary")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#config-path", Input).focus()
+
+    @on(Button.Pressed, "#submit")
+    def submit(self) -> None:
+        self.dismiss(self.query_one("#config-path", Input).value)
+
+    @on(Button.Pressed, "#cancel")
+    def cancel(self) -> None:
+        self.dismiss(None)
+
+
+def _split_parameters(value: str) -> list[str]:
+    if not value.strip():
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def _shorten(value: str, max_len: int) -> str:

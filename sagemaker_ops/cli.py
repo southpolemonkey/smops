@@ -31,14 +31,14 @@ from sagemaker_ops.aws import (
     wait_pipeline_execution,
     wait_processing_job,
 )
-from sagemaker_ops.tui import ProcessingJobsApp, PipelineExecutionsApp
+from sagemaker_ops.tui import ProcessingJobsApp, PipelineExecutionsApp, SmopsTuiApp
 
 
 console = Console()
 app = typer.Typer(help="SageMaker Processing Job and Pipeline operations CLI.", no_args_is_help=True)
 processing_app = typer.Typer(help="Submit and inspect SageMaker Processing Jobs.", no_args_is_help=True)
 pipeline_app = typer.Typer(help="Start and inspect SageMaker Pipelines.", no_args_is_help=True)
-tui_app = typer.Typer(help="Interactive TUI views.", no_args_is_help=True)
+tui_app = typer.Typer(help="Interactive TUI views.", invoke_without_command=True, no_args_is_help=False)
 config_app = typer.Typer(help="Manage smops defaults.", no_args_is_help=True)
 app.add_typer(processing_app, name="processing")
 app.add_typer(pipeline_app, name="pipeline")
@@ -537,6 +537,25 @@ def pipeline_diagnose(
         console.print(f"Logs: {diagnosis['log_group']} / {diagnosis['log_stream_prefix']}")
     for line in diagnosis["log_tail"]:
         console.print(line)
+
+
+@tui_app.callback(invoke_without_command=True)
+def tui_main(
+    ctx: typer.Context,
+    profile: Annotated[list[str] | None, typer.Option("--profile", "-p", help="AWS profile. Can be passed multiple times.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    all_profiles: Annotated[bool, typer.Option("--all-profiles", help="Inspect all local AWS profiles.")] = False,
+    refresh: Annotated[int, typer.Option("--refresh", min=5, max=300, help="Refresh interval in seconds.")] = 15,
+    hours: Annotated[int, typer.Option("--hours", min=1, max=168, help="Include pipeline executions completed within this many hours.")] = 3,
+) -> None:
+    """Open the smops TUI selector when no TUI subcommand is provided."""
+    if ctx.invoked_subcommand is not None:
+        return
+    selected = SmopsTuiApp().run()
+    if selected == "processing":
+        ProcessingJobsApp(tuple(profile or ()), _effective_region(region), all_profiles, refresh).run()
+    elif selected == "pipelines":
+        PipelineExecutionsApp(tuple(profile or ()), _effective_region(region), all_profiles, refresh, None, hours).run()
 
 
 @tui_app.command("processing")

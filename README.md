@@ -129,6 +129,23 @@ smops pipeline start \
   --parameter Mode=prod
 ```
 
+## Interactive TUI
+
+Open the TUI selector and choose between Pipelines and Processing Jobs:
+
+```bash
+smops tui --profile dev
+```
+
+Inside the TUI:
+
+- `p` / `P`: switch to the next AWS profile from your local AWS config
+- `s`: start a pipeline or submit a processing job from the current TUI
+- `r`: refresh
+- `q`: quit
+
+For pipeline starts, enter the pipeline name, optional display name, and optional comma-separated parameters such as `InputDate=2026-07-01,Mode=test`. For processing job submits, enter the path to a JSON/YAML config file using the same structure as boto3 `create_processing_job`.
+
 ## Processing Jobs TUI
 
 ```bash
@@ -150,6 +167,8 @@ smops tui processing --all-profiles
 Keyboard shortcuts:
 
 - `Up` / `Down` or `Left` / `Right`: switch jobs
+- `p` / `P`: switch to the next AWS profile
+- `s`: submit a Processing Job from a JSON/YAML config file
 - `r`: refresh
 - `q`: quit
 
@@ -175,6 +194,8 @@ Keyboard shortcuts:
 
 - `Left` / `Right`: switch focus between the executions and steps panels
 - `Up` / `Down`: move within the focused panel
+- `p` / `P`: switch to the next AWS profile
+- `s`: start a Pipeline execution
 - `l`: load the CloudWatch log tail for the selected failed step
 - `r`: refresh
 - `q`: quit

@@ -19,7 +19,7 @@ from sagemaker_ops.aws import (
     tail_step_logs,
 )
 from sagemaker_ops.cli import app
-from sagemaker_ops.tui import PipelineExecutionsApp, ProcessingJobsApp
+from sagemaker_ops.tui import PipelineExecutionsApp, ProcessingJobsApp, SmopsTuiApp
 
 from .conftest import (
     ACCOUNT_ID,
@@ -357,6 +357,109 @@ def test_aws_helpers_read_active_processing_and_pipeline_state_with_moto(
     assert executions[0].pipeline_name == "e2e-pipeline"
     assert executions[0].status == "Executing"
     assert [step["StepName"] for step in steps] == ["PrepareData", "ValidateData"]
+
+
+def test_smops_tui_home_selects_processing_view():
+    async def run_app() -> None:
+        app_under_test = SmopsTuiApp()
+        async with app_under_test.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            table = app_under_test.query_one("#home", DataTable)
+            assert table.row_count == 2
+            await pilot.press("down")
+            await pilot.press("enter")
+            assert app_under_test.return_value == "processing"
+
+    asyncio.run(run_app())
+
+
+def test_processing_tui_switches_profile_with_picker(monkeypatch, sagemaker_client, logs_client):
+    create_active_processing_job(sagemaker_client, "profile-processing")
+    ctx = context_with_steps(sagemaker_client, logs_client, "unused")
+    monkeypatch.setattr(tui_module, "available_profiles", lambda: ["mock-dev", "mock-prod"])
+    monkeypatch.setattr(tui_module, "build_contexts", lambda profiles, *_args, **_kwargs: [ctx])
+
+    async def run_app() -> None:
+        app_under_test = ProcessingJobsApp(("mock-dev",), REGION, False, 60)
+        async with app_under_test.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            assert app_under_test.profiles == ("mock-prod",)
+            assert app_under_test.all_profiles is False
+
+    asyncio.run(run_app())
+
+
+def test_tui_start_shortcuts_open_forms(monkeypatch, sagemaker_client, logs_client):
+    ctx = context_with_steps(sagemaker_client, logs_client, "unused")
+    monkeypatch.setattr(tui_module, "build_contexts", lambda *_args, **_kwargs: [ctx])
+
+    async def run_processing() -> None:
+        app_under_test = ProcessingJobsApp(("mock-dev",), REGION, False, 60)
+        async with app_under_test.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            assert app_under_test.screen.__class__.__name__ == "ProcessingSubmitScreen"
+
+    async def run_pipeline() -> None:
+        app_under_test = PipelineExecutionsApp(("mock-dev",), REGION, False, 60, "startable-pipeline")
+        async with app_under_test.run_test(size=(160, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            assert app_under_test.screen.__class__.__name__ == "PipelineStartScreen"
+
+    asyncio.run(run_processing())
+    asyncio.run(run_pipeline())
+
+
+def test_pipeline_tui_can_start_pipeline_from_form_callback(monkeypatch, sagemaker_client, logs_client):
+    sagemaker_client.create_pipeline(
+        PipelineName="startable-pipeline",
+        RoleArn="arn:aws:iam::123456789012:role/SageMakerExecutionRole",
+        PipelineDefinition='{"Version": "2020-12-01", "Steps": []}',
+    )
+    ctx = context_with_steps(sagemaker_client, logs_client, "unused")
+    monkeypatch.setattr(tui_module, "build_contexts", lambda *_args, **_kwargs: [ctx])
+
+    async def run_app() -> None:
+        app_under_test = PipelineExecutionsApp(("mock-dev",), REGION, False, 60, "startable-pipeline")
+        async with app_under_test.run_test(size=(160, 50)) as pilot:
+            await pilot.pause()
+            app_under_test.start_pipeline_from_form(
+                {
+                    "pipeline_name": "startable-pipeline",
+                    "display_name": "from-tui",
+                    "parameters": "Mode=test",
+                }
+            )
+            await pilot.pause()
+            executions = sagemaker_client.list_pipeline_executions(PipelineName="startable-pipeline")[
+                "PipelineExecutionSummaries"
+            ]
+            assert executions
+
+    asyncio.run(run_app())
+
+
+def test_processing_tui_can_submit_processing_from_form_callback(monkeypatch, tmp_path, sagemaker_client, logs_client):
+    spec_path = tmp_path / "tui-processing.json"
+    spec_path.write_text(json.dumps(processing_job_spec("tui-processing")), encoding="utf-8")
+    ctx = context_with_steps(sagemaker_client, logs_client, "unused")
+    monkeypatch.setattr(tui_module, "build_contexts", lambda *_args, **_kwargs: [ctx])
+
+    async def run_app() -> None:
+        app_under_test = ProcessingJobsApp(("mock-dev",), REGION, False, 60)
+        async with app_under_test.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app_under_test.submit_processing_from_form(str(spec_path))
+            await pilot.pause()
+            detail = sagemaker_client.describe_processing_job(ProcessingJobName="tui-processing")
+            assert detail["ProcessingJobName"] == "tui-processing"
+
+    asyncio.run(run_app())
 
 
 def test_processing_tui_shows_running_jobs_and_keyboard_navigation(monkeypatch, sagemaker_client, logs_client):
