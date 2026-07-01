@@ -16,11 +16,35 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-如果要读取 YAML 配置：
+从 GitHub 直接安装：
+
+```bash
+pip install git+https://github.com/southpolemonkey/smops.git
+```
+
+从本地 wheel 安装：
+
+```bash
+pip install dist/sagemaker_ops_cli-0.1.0-py3-none-any.whl
+```
+
+如果要读取 YAML 配置:
 
 ```bash
 pip install -e '.[yaml]'
 ```
+
+## 构建 Python 包
+
+```bash
+pip install -e '.[dev]'
+python -m build
+```
+
+构建产物会输出到 `dist/`：
+
+- `sagemaker_ops_cli-0.1.0-py3-none-any.whl`
+- `sagemaker_ops_cli-0.1.0.tar.gz`
 
 ## 提交 Processing Job
 

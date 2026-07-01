@@ -286,6 +286,13 @@ def test_pipeline_tui_shows_executions_steps_and_loads_failed_logs(
             selected = app_under_test.selected_step()
             assert selected is not None
             assert selected["StepName"] == "ValidateData"
+            assert app_under_test.loaded_log_step_key == (execution_arn, "ValidateData")
             assert any("boom: validation failed" in line for line in tail_step_logs(ctx, selected))
+
+            app_under_test.action_refresh()
+            await pilot.pause()
+            assert steps.cursor_row == 1
+            assert app_under_test.selected_step()["StepName"] == "ValidateData"
+            assert app_under_test.loaded_log_step_key == (execution_arn, "ValidateData")
 
     asyncio.run(run_app())

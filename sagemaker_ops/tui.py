@@ -49,16 +49,24 @@ class BaseSageMakerApp(App[None]):
         width: 40%;
     }
 
-    #left-pane, #right-pane {
+    #pipeline-content {
         height: 1fr;
     }
 
-    #left-pane {
-        width: 52%;
+    #executions-pane {
+        height: 42%;
     }
 
-    #right-pane {
+    #bottom-pane {
+        height: 58%;
+    }
+
+    #steps-pane {
         width: 48%;
+    }
+
+    #logs-pane {
+        width: 52%;
     }
     """
 
@@ -223,20 +231,28 @@ class PipelineExecutionsApp(BaseSageMakerApp):
         self.executions: list[tuple[AwsContext, PipelineExecutionView]] = []
         self.steps: list[dict[str, Any]] = []
         self.selected_context: AwsContext | None = None
+        self.selected_execution_arn: str | None = None
+        self.loaded_log_step_key: tuple[str, str] | None = None
+        self._rendering_executions = False
+        self._updating_steps = False
+        self._suppress_next_execution_highlight = False
+        self._suppress_next_step_highlight = False
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("Loading...", id="status")
-        with Horizontal(id="content"):
-            with Vertical(id="left-pane"):
+        with Vertical(id="pipeline-content"):
+            with Vertical(id="executions-pane"):
                 executions = DataTable(id="executions")
                 executions.cursor_type = "row"
                 yield executions
-            with Vertical(id="right-pane"):
-                steps = DataTable(id="steps")
-                steps.cursor_type = "row"
-                yield steps
-                yield RichLog(id="logs", wrap=True, highlight=True)
+            with Horizontal(id="bottom-pane"):
+                with Vertical(id="steps-pane"):
+                    steps = DataTable(id="steps")
+                    steps.cursor_type = "row"
+                    yield steps
+                with Vertical(id="logs-pane"):
+                    yield RichLog(id="logs", wrap=True, highlight=True, auto_scroll=False)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -247,6 +263,8 @@ class PipelineExecutionsApp(BaseSageMakerApp):
         super().on_mount()
 
     def action_refresh(self) -> None:
+        previous_execution_arn = self.selected_execution_arn
+        previous_step_name = self.selected_step_name()
         try:
             pairs: list[tuple[AwsContext, PipelineExecutionView]] = []
             for ctx in self.load_contexts():
@@ -255,7 +273,7 @@ class PipelineExecutionsApp(BaseSageMakerApp):
                 ):
                     pairs.append((ctx, execution))
             self.executions = pairs
-            self.render_executions()
+            self.render_executions(previous_execution_arn, previous_step_name, preserve_logs=True)
             self.query_one("#status", Static).update(
                 f"{len(self.executions)} active/recent pipeline execution(s), window={self.recent_hours}h. "
                 "Use left/right to switch panes, arrows to move, l to load failed-step logs."
@@ -272,23 +290,41 @@ class PipelineExecutionsApp(BaseSageMakerApp):
     def action_load_logs(self) -> None:
         self.load_selected_step_logs()
 
-    def render_executions(self) -> None:
+    def render_executions(
+        self,
+        preferred_execution_arn: str | None = None,
+        preferred_step_name: str | None = None,
+        preserve_logs: bool = False,
+    ) -> None:
         table = self.query_one("#executions", DataTable)
-        table.clear()
-        for index, (_, execution) in enumerate(self.executions):
-            table.add_row(
-                execution.profile,
-                execution.region,
-                execution.pipeline_name,
-                execution.display_name or execution.execution_arn.rsplit("/", 1)[-1],
-                execution.status,
-                format_duration(execution.start_time),
-                key=str(index),
-            )
-        self.update_steps(0 if self.executions else None)
+        selected_index = 0 if self.executions else None
+        self._rendering_executions = True
+        try:
+            table.clear()
+            for index, (_, execution) in enumerate(self.executions):
+                if preferred_execution_arn and execution.execution_arn == preferred_execution_arn:
+                    selected_index = index
+                table.add_row(
+                    execution.profile,
+                    execution.region,
+                    execution.pipeline_name,
+                    execution.display_name or execution.execution_arn.rsplit("/", 1)[-1],
+                    execution.status,
+                    format_duration(execution.start_time),
+                    key=str(index),
+                )
+            if selected_index is not None and table.row_count:
+                self._suppress_next_execution_highlight = True
+                table.move_cursor(row=selected_index, scroll=False)
+        finally:
+            self._rendering_executions = False
+        self.update_steps(selected_index, preferred_step_name=preferred_step_name, preserve_logs=preserve_logs)
 
     @on(DataTable.RowHighlighted, "#executions")
     def on_execution_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if self._rendering_executions or self._suppress_next_execution_highlight:
+            self._suppress_next_execution_highlight = False
+            return
         try:
             self.update_steps(int(str(event.row_key.value)))
         except (TypeError, ValueError):
@@ -296,39 +332,70 @@ class PipelineExecutionsApp(BaseSageMakerApp):
 
     @on(DataTable.RowHighlighted, "#steps")
     def on_step_highlighted(self, _: DataTable.RowHighlighted) -> None:
+        if self._updating_steps or self._suppress_next_step_highlight:
+            self._suppress_next_step_highlight = False
+            return
+        if self.loaded_log_step_key == self.selected_step_key():
+            return
+        self.loaded_log_step_key = None
         self.render_step_failure_or_hint()
 
-    def update_steps(self, index: int | None) -> None:
+    def update_steps(
+        self,
+        index: int | None,
+        preferred_step_name: str | None = None,
+        preserve_logs: bool = False,
+    ) -> None:
         self.steps = []
         self.selected_context = None
+        self.selected_execution_arn = None
         logs = self.query_one("#logs", RichLog)
-        logs.clear()
         if index is None or index >= len(self.executions):
             self.query_one("#steps", DataTable).clear()
+            self.loaded_log_step_key = None
+            logs.clear()
             logs.write(f"No active or recent pipeline executions in the last {self.recent_hours}h.")
             return
 
         ctx, execution = self.executions[index]
         self.selected_context = ctx
+        self.selected_execution_arn = execution.execution_arn
         try:
             self.steps = list_pipeline_steps(ctx, execution.execution_arn)
         except AwsCliError as exc:
+            self.loaded_log_step_key = None
+            logs.clear()
             logs.write(str(exc))
             return
         table = self.query_one("#steps", DataTable)
-        table.clear()
-        for step_index, step in enumerate(self.steps):
-            table.add_row(
-                step.get("StepName", ""),
-                step.get("StepType", ""),
-                step.get("StepStatus", ""),
-                format_duration(step.get("StartTime"), step.get("EndTime")),
-                _shorten(step.get("FailureReason", ""), 80),
-                key=str(step_index),
-            )
+        selected_step_index = 0 if self.steps else None
+        self._updating_steps = True
+        try:
+            table.clear()
+            for step_index, step in enumerate(self.steps):
+                if preferred_step_name and step.get("StepName", "") == preferred_step_name:
+                    selected_step_index = step_index
+                table.add_row(
+                    step.get("StepName", ""),
+                    step.get("StepType", ""),
+                    step.get("StepStatus", ""),
+                    format_duration(step.get("StartTime"), step.get("EndTime")),
+                    _shorten(step.get("FailureReason", ""), 80),
+                    key=str(step_index),
+                )
+            if selected_step_index is not None and table.row_count:
+                self._suppress_next_step_highlight = True
+                table.move_cursor(row=selected_step_index, scroll=False)
+        finally:
+            self._updating_steps = False
+        if preserve_logs and self.loaded_log_step_key == self.selected_step_key():
+            return
+        self.loaded_log_step_key = None
         self.render_step_failure_or_hint()
 
     def render_step_failure_or_hint(self) -> None:
+        if self.loaded_log_step_key == self.selected_step_key():
+            return
         logs = self.query_one("#logs", RichLog)
         logs.clear()
         step = self.selected_step()
@@ -355,8 +422,10 @@ class PipelineExecutionsApp(BaseSageMakerApp):
         logs = self.query_one("#logs", RichLog)
         logs.clear()
         if ctx is None or step is None:
+            self.loaded_log_step_key = None
             logs.write("Select a pipeline step first.")
             return
+        self.loaded_log_step_key = self.selected_step_key()
         failure = step.get("FailureReason")
         if failure:
             logs.write(f"[bold red]Failure[/bold red] {failure}")
@@ -368,6 +437,18 @@ class PipelineExecutionsApp(BaseSageMakerApp):
         if not self.steps or table.cursor_row >= len(self.steps):
             return None
         return self.steps[table.cursor_row]
+
+    def selected_step_name(self) -> str | None:
+        step = self.selected_step()
+        if step is None:
+            return None
+        return step.get("StepName", "")
+
+    def selected_step_key(self) -> tuple[str, str] | None:
+        step_name = self.selected_step_name()
+        if not self.selected_execution_arn or not step_name:
+            return None
+        return self.selected_execution_arn, step_name
 
 
 def _shorten(value: str, max_len: int) -> str:

@@ -19,9 +19,11 @@ dependencies = [
 [project.optional-dependencies]
 yaml = ["PyYAML>=6.0.0"]
 dev = [
+    "build>=1.2.0",
     "moto[logs,sagemaker]>=5.0.0",
     "pytest>=8.0.0",
     "ruff>=0.5.0",
+    "twine>=5.0.0",
 ]
 
 [project.scripts]
