@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +15,8 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 ACTIVE_PROCESSING_STATUSES = ("InProgress", "Stopping")
 ACTIVE_PIPELINE_STATUSES = ("Executing", "Stopping")
+TERMINAL_PROCESSING_STATUSES = ("Completed", "Failed", "Stopped")
+TERMINAL_PIPELINE_STATUSES = ("Succeeded", "Failed", "Stopped")
 
 
 class AwsCliError(RuntimeError):
@@ -143,6 +146,32 @@ def submit_processing_job(ctx: AwsContext, spec: dict[str, Any]) -> dict[str, An
         raise AwsCliError(f"提交 processing job 失败: {exc}") from exc
 
 
+def describe_processing_job(ctx: AwsContext, job_name: str) -> ProcessingJobView:
+    try:
+        detail = ctx.sagemaker.describe_processing_job(ProcessingJobName=job_name)
+    except (BotoCoreError, ClientError) as exc:
+        raise AwsCliError(f"读取 processing job 失败 job={job_name}: {exc}") from exc
+    return _processing_job_view_from_detail(ctx, detail)
+
+
+def wait_processing_job(
+    ctx: AwsContext,
+    job_name: str,
+    timeout_seconds: int = 3600,
+    poll_seconds: int = 30,
+) -> ProcessingJobView:
+    deadline = time.monotonic() + max(0, timeout_seconds)
+    poll_seconds = max(1, poll_seconds)
+
+    while True:
+        job = describe_processing_job(ctx, job_name)
+        if job.status in TERMINAL_PROCESSING_STATUSES:
+            return job
+        if time.monotonic() >= deadline:
+            raise AwsCliError(f"等待 processing job 超时 job={job_name} status={job.status}")
+        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+
+
 def start_pipeline_execution(
     ctx: AwsContext,
     pipeline_name: str,
@@ -214,13 +243,22 @@ def _processing_job_view_from_summary(ctx: AwsContext, summary: dict[str, Any]) 
         detail = ctx.sagemaker.describe_processing_job(ProcessingJobName=name)
     except (BotoCoreError, ClientError):
         detail = summary
+    return _processing_job_view_from_detail(ctx, detail, fallback=summary)
+
+
+def _processing_job_view_from_detail(
+    ctx: AwsContext,
+    detail: dict[str, Any],
+    fallback: dict[str, Any] | None = None,
+) -> ProcessingJobView:
+    fallback = fallback or {}
     cluster = detail.get("ProcessingResources", {}).get("ClusterConfig", {})
     return ProcessingJobView(
         profile=ctx.profile,
         region=ctx.region,
-        name=name,
-        status=detail.get("ProcessingJobStatus", summary.get("ProcessingJobStatus", "")),
-        creation_time=detail.get("CreationTime", summary.get("CreationTime")),
+        name=detail.get("ProcessingJobName", fallback.get("ProcessingJobName", "")),
+        status=detail.get("ProcessingJobStatus", fallback.get("ProcessingJobStatus", "")),
+        creation_time=detail.get("CreationTime", fallback.get("CreationTime")),
         last_modified_time=detail.get("LastModifiedTime"),
         started_time=detail.get("ProcessingStartTime"),
         ended_time=detail.get("ProcessingEndTime"),
@@ -228,7 +266,7 @@ def _processing_job_view_from_summary(ctx: AwsContext, summary: dict[str, Any]) 
         instance_count=cluster.get("InstanceCount"),
         role_arn=detail.get("RoleArn", ""),
         failure_reason=detail.get("FailureReason", ""),
-        arn=detail.get("ProcessingJobArn", summary.get("ProcessingJobArn", "")),
+        arn=detail.get("ProcessingJobArn", fallback.get("ProcessingJobArn", "")),
     )
 
 
@@ -405,6 +443,71 @@ def describe_pipeline_execution(ctx: AwsContext, execution_arn: str) -> dict[str
         raise AwsCliError(f"读取 pipeline execution 失败: {exc}") from exc
 
 
+def wait_pipeline_execution(
+    ctx: AwsContext,
+    execution_arn: str,
+    timeout_seconds: int = 3600,
+    poll_seconds: int = 30,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + max(0, timeout_seconds)
+    poll_seconds = max(1, poll_seconds)
+
+    while True:
+        detail = describe_pipeline_execution(ctx, execution_arn)
+        status = detail.get("PipelineExecutionStatus", "")
+        if status in TERMINAL_PIPELINE_STATUSES:
+            return detail
+        if time.monotonic() >= deadline:
+            raise AwsCliError(f"等待 pipeline execution 超时 execution={execution_arn} status={status}")
+        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+
+
+def inspect_pipeline_execution(ctx: AwsContext, execution_arn: str) -> dict[str, Any]:
+    detail = describe_pipeline_execution(ctx, execution_arn)
+    detail = {
+        **detail,
+        "PipelineExecutionArn": detail.get("PipelineExecutionArn") or execution_arn,
+        "PipelineName": detail.get("PipelineName") or _pipeline_name_from_execution_arn(execution_arn),
+    }
+    steps = list_pipeline_steps(ctx, execution_arn)
+    failed_steps = [step for step in steps if step.get("StepStatus") == "Failed"]
+    return {
+        "profile": ctx.profile,
+        "region": ctx.region,
+        "execution": detail,
+        "steps": steps,
+        "failed_steps": failed_steps,
+    }
+
+
+def diagnose_pipeline_execution(
+    ctx: AwsContext,
+    execution_arn: str,
+    log_limit: int = 80,
+) -> dict[str, Any]:
+    inspection = inspect_pipeline_execution(ctx, execution_arn)
+    failed_steps = inspection["failed_steps"]
+    failed_step = failed_steps[0] if failed_steps else None
+    log_source = infer_log_source(failed_step) if failed_step else None
+    log_tail = tail_step_logs(ctx, failed_step, limit=log_limit) if failed_step else []
+    job_type = None
+    job_name = None
+    if log_source and failed_step:
+        job_type = _step_job_type(failed_step)
+        job_name = log_source[1]
+
+    return {
+        **inspection,
+        "failed_step": failed_step,
+        "job_type": job_type,
+        "job_name": job_name,
+        "log_group": log_source[0] if log_source else None,
+        "log_stream_prefix": log_source[1] if log_source else None,
+        "log_tail": log_tail,
+        "next_actions": _diagnostic_next_actions(execution_arn, failed_step),
+    }
+
+
 def tail_step_logs(ctx: AwsContext, step: dict[str, Any], limit: int = 80) -> list[str]:
     source = infer_log_source(step)
     if source is None:
@@ -465,6 +568,39 @@ def infer_log_source(step: dict[str, Any]) -> tuple[str, str] | None:
         if arn:
             return log_group, arn.rsplit("/", 1)[-1]
     return None
+
+
+def _step_job_type(step: dict[str, Any]) -> str | None:
+    metadata = step.get("Metadata") or {}
+    for key in ("ProcessingJob", "TrainingJob", "TransformJob"):
+        if isinstance(metadata.get(key), dict):
+            return key
+    return None
+
+
+def _pipeline_name_from_execution_arn(execution_arn: str) -> str:
+    marker = ":pipeline/"
+    if marker not in execution_arn:
+        return ""
+    tail = execution_arn.split(marker, 1)[1]
+    return tail.split("/", 1)[0]
+
+
+def _diagnostic_next_actions(execution_arn: str, failed_step: dict[str, Any] | None) -> list[dict[str, str]]:
+    actions = [
+        {
+            "type": "inspect",
+            "command": f"smops pipeline inspect --execution-arn {execution_arn} --json",
+        }
+    ]
+    if failed_step:
+        actions.append(
+            {
+                "type": "diagnose",
+                "command": f"smops pipeline diagnose --execution-arn {execution_arn} --json",
+            }
+        )
+    return actions
 
 
 def format_dt(value: datetime | None) -> str:

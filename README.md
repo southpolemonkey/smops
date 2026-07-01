@@ -1,14 +1,57 @@
 # SageMaker Ops CLI
 
-`smops` 是一个面向 SageMaker Processing Job 和 SageMaker Pipeline 的命令行工具：
+`smops` is a command-line tool for operating Amazon SageMaker Processing Jobs and SageMaker Pipelines.
 
-- 提交 SageMaker Processing Job
-- 启动 SageMaker Pipeline execution
-- 用 TUI 查看正在运行的 Processing Jobs
-- 用 TUI 查看正在运行和最近结束的 Pipeline executions、steps 状态和失败 step 的 CloudWatch 日志尾部
-- 支持单个、多个或所有 AWS profiles
+It can:
 
-## 安装
+- Submit SageMaker Processing Jobs
+- Start SageMaker Pipeline executions
+- Show running Processing Jobs in an interactive TUI
+- Show running and recently completed Pipeline executions in an interactive TUI
+- Inspect Pipeline step status and failed step CloudWatch logs
+- Work with one, many, or all configured AWS profiles
+
+## Installation
+
+Install from PyPI:
+
+```bash
+pip install sagemaker-ops-cli
+```
+
+The installed command is:
+
+```bash
+smops --help
+```
+
+Install from GitHub:
+
+```bash
+pip install git+https://github.com/southpolemonkey/smops.git
+```
+
+Install from a local wheel:
+
+```bash
+pip install dist/sagemaker_ops_cli-0.2.0-py3-none-any.whl
+```
+
+Install with Homebrew:
+
+```bash
+brew tap southpolemonkey/smops https://github.com/southpolemonkey/smops
+brew install sagemaker-ops-cli
+```
+
+If the formula is later moved into a dedicated `southpolemonkey/homebrew-smops` tap repository, users can use the shorter command:
+
+```bash
+brew tap southpolemonkey/smops
+brew install sagemaker-ops-cli
+```
+
+For local development:
 
 ```bash
 python -m venv .venv
@@ -16,39 +59,27 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-从 GitHub 直接安装：
-
-```bash
-pip install git+https://github.com/southpolemonkey/smops.git
-```
-
-从本地 wheel 安装：
-
-```bash
-pip install dist/sagemaker_ops_cli-0.1.0-py3-none-any.whl
-```
-
-如果要读取 YAML 配置:
+To enable YAML config files:
 
 ```bash
 pip install -e '.[yaml]'
 ```
 
-## 构建 Python 包
+## Build The Python Package
 
 ```bash
 pip install -e '.[dev]'
 python -m build
 ```
 
-构建产物会输出到 `dist/`：
+Build artifacts are written to `dist/`:
 
-- `sagemaker_ops_cli-0.1.0-py3-none-any.whl`
-- `sagemaker_ops_cli-0.1.0.tar.gz`
+- `sagemaker_ops_cli-0.2.0-py3-none-any.whl`
+- `sagemaker_ops_cli-0.2.0.tar.gz`
 
-## 提交 Processing Job
+## Submit A Processing Job
 
-配置文件直接使用 boto3 `create_processing_job` 的参数结构。
+The config file uses the same parameter structure as boto3 `create_processing_job`.
 
 ```bash
 smops processing submit \
@@ -57,13 +88,13 @@ smops processing submit \
   --config examples/processing-job.json
 ```
 
-只检查请求内容，不提交：
+Validate the request without submitting it:
 
 ```bash
 smops processing submit --config examples/processing-job.json --dry-run
 ```
 
-## 启动 Pipeline
+## Start A Pipeline Execution
 
 ```bash
 smops pipeline start \
@@ -75,88 +106,109 @@ smops pipeline start \
   --parameter Mode=prod
 ```
 
-## TUI 查看 Processing Jobs
+## Processing Jobs TUI
 
 ```bash
 smops tui processing --profile dev --region us-east-1
 ```
 
-多个 profile：
+Multiple profiles:
 
 ```bash
 smops tui processing --profile dev --profile prod --region us-east-1
 ```
 
-所有 profile：
+All profiles:
 
 ```bash
 smops tui processing --all-profiles
 ```
 
-快捷键：
+Keyboard shortcuts:
 
-- `↑/↓` 或 `←/→` 切换 job
-- `r` 刷新
-- `q` 退出
+- `Up` / `Down` or `Left` / `Right`: switch jobs
+- `r`: refresh
+- `q`: quit
 
-## TUI 查看 Pipelines
+## Pipelines TUI
 
 ```bash
 smops tui pipelines --profile dev --region us-east-1
 ```
 
-只看某个 pipeline：
+Filter to one pipeline:
 
 ```bash
 smops tui pipelines --profile dev --region us-east-1 --name my-pipeline
 ```
 
-默认会显示正在运行的 executions，以及最近 3 小时内结束的 executions，方便查看成功/失败结果。可以用 `--hours` 调整窗口：
+By default, the TUI shows running executions plus executions completed within the last 3 hours, so you can inspect recent success and failure results. Use `--hours` to adjust the time window:
 
 ```bash
 smops tui pipelines --profile dev --region us-east-1 --name my-pipeline --hours 6
 ```
 
-快捷键：
+Keyboard shortcuts:
 
-- `←/→` 在 executions 和 steps 面板之间切换
-- `↑/↓` 移动当前面板选中行
-- `l` 加载选中失败 step 的 CloudWatch 日志尾部
-- `r` 刷新
-- `q` 退出
+- `Left` / `Right`: switch focus between the executions and steps panels
+- `Up` / `Down`: move within the focused panel
+- `l`: load the CloudWatch log tail for the selected failed step
+- `r`: refresh
+- `q`: quit
 
-目前自动支持这些 step 的日志定位：
+Log discovery is currently supported for these step job types:
 
 - ProcessingJob: `/aws/sagemaker/ProcessingJobs`
 - TrainingJob: `/aws/sagemaker/TrainingJobs`
 - TransformJob: `/aws/sagemaker/TransformJobs`
 
-## 非交互式查看
+## Non-Interactive Commands
 
 ```bash
 smops processing list --profile dev --region us-east-1
+smops processing wait --profile dev --region us-east-1 --name my-processing-job
 smops pipeline list --profile dev --region us-east-1
 smops pipeline list --profile dev --region us-east-1 --name my-pipeline --hours 6
 smops pipeline steps --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:...
+smops pipeline wait --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:...
+smops pipeline inspect --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:...
+smops pipeline diagnose --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:...
 ```
 
-`processing list` 默认每页读取 20 个 running jobs。输出 `Next token` 时，用它继续翻页：
+Most non-interactive commands support `--json` for agents and automation:
+
+```bash
+smops processing list --profile dev --region us-east-1 --json
+smops processing wait --profile dev --region us-east-1 --name my-processing-job --json
+smops pipeline start --profile dev --region us-east-1 --name my-pipeline --json
+smops pipeline list --profile dev --region us-east-1 --json
+smops pipeline steps --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:... --json
+smops pipeline wait --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:... --json
+smops pipeline inspect --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:... --json
+smops pipeline diagnose --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:... --json
+```
+
+JSON responses use a stable envelope. Successful commands return `status: "ok"`; errors return `status: "error"` and a user-facing `error` message. List commands return `items`, `count`, and `next_token`.
+
+`pipeline inspect` returns execution details, all steps, and failed steps. `pipeline diagnose` extends that with the first failed step, inferred SageMaker job type/name, CloudWatch log group and stream prefix, log tail, and suggested next actions.
+
+`processing list` reads 20 running jobs per page by default. If the output includes `Next token`, pass it to fetch the next page:
 
 ```bash
 smops processing list --profile dev --region us-east-1 --max-results 20
 smops processing list --profile dev --region us-east-1 --max-results 20 --next-token '<token>'
 ```
 
-`pipeline list` 不传 `--name` 时默认每页只扫描 10 个 pipelines，避免真实账号里 pipelines 很多时卡住。输出 `Next token` 时，用它继续翻页：
+When `pipeline list` is used without `--name`, it scans 10 pipelines per page by default. This avoids long hangs in AWS accounts with many pipelines. If the output includes `Next token`, pass it to continue scanning:
 
 ```bash
 smops pipeline list --profile dev --region us-east-1 --pipeline-page-size 10
 smops pipeline list --profile dev --region us-east-1 --pipeline-page-size 10 --next-token '<token>'
 ```
 
-## AWS 权限
+## AWS Permissions
 
-运行账号需要至少具备这些权限：
+The AWS identity used by `smops` needs at least these permissions:
 
 - `sagemaker:CreateProcessingJob`
 - `sagemaker:StartPipelineExecution`
@@ -169,10 +221,9 @@ smops pipeline list --profile dev --region us-east-1 --pipeline-page-size 10 --n
 - `logs:DescribeLogStreams`
 - `logs:GetLogEvents`
 
-
 ## Mock AWS Profile
 
-仓库里提供了一套 mock AWS 配置，方便本地演示 profile 切换和 CLI 参数解析，不会写入真实 `~/.aws`：
+This repository includes mock AWS config files for local demos of profile switching and CLI argument parsing. They do not write to your real `~/.aws` files:
 
 ```bash
 export AWS_CONFIG_FILE=examples/aws/config
@@ -181,7 +232,7 @@ export AWS_PROFILE=mock-dev
 export AWS_DEFAULT_REGION=us-east-1
 ```
 
-也可以直接加载样例环境变量：
+You can also load the sample environment file directly:
 
 ```bash
 set -a
@@ -189,7 +240,7 @@ source examples/aws/mock.env
 set +a
 ```
 
-然后运行：
+Then run:
 
 ```bash
 smops processing submit --config examples/processing-job.json --dry-run
@@ -197,25 +248,25 @@ smops processing list --profile mock-dev
 smops tui processing --profile mock-dev
 ```
 
-注意：这套 credentials 是 dummy 值，只适合 dry-run、mock、本地端点或配合 botocore Stubber/moto 使用；直接访问真实 AWS 会认证失败。
+The bundled credentials are dummy values. They are only intended for dry runs, mock environments, local endpoints, or tests that use botocore Stubber/moto. They will not authenticate against real AWS.
 
-## E2E 测试
+## E2E Tests
 
-测试使用 `moto` 模拟 AWS SageMaker 和 CloudWatch Logs，不会访问真实 AWS：
+The tests use `moto` to simulate AWS SageMaker and CloudWatch Logs. They do not call real AWS services:
 
 ```bash
 pip install -e '.[dev]'
 pytest
 ```
 
-覆盖范围包括：
+Coverage includes:
 
-- Processing Job 提交和 running job 分页列表
-- Pipeline execution 启动和 active/recent execution 列表
-- Pipeline steps 状态展示
-- 失败 step 的 CloudWatch Logs tail
-- Processing Job TUI 的上下左右键导航
-- Pipeline TUI 的 executions、steps 和失败日志加载
-- 多 AWS profile 解析
+- Processing Job submission and paginated running job lists
+- Pipeline execution start and active/recent execution lists
+- Pipeline step status display
+- Failed step CloudWatch Logs tailing
+- Processing Job TUI keyboard navigation with up, down, left, and right
+- Pipeline TUI execution, step, and failed log loading
+- Multiple AWS profile resolution
 
-Moto 目前还没有实现 `list_pipeline_execution_steps`，测试里对这一个 paginator 做了内存 fake，其余 SageMaker/Logs 调用都在 moto 环境中执行。
+Moto does not currently implement `list_pipeline_execution_steps`, so that paginator is faked in memory in the tests. The other SageMaker and CloudWatch Logs calls run inside the moto environment.

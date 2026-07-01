@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 
 from textual.widgets import DataTable
@@ -21,11 +22,13 @@ from sagemaker_ops.cli import app
 from sagemaker_ops.tui import PipelineExecutionsApp, ProcessingJobsApp
 
 from .conftest import (
+    ACCOUNT_ID,
     REGION,
     context_with_steps,
     create_active_pipeline_execution,
     create_active_processing_job,
     pipeline_steps,
+    processing_job_spec,
     seed_failed_step_logs,
 )
 
@@ -209,6 +212,85 @@ def test_pipeline_list_excludes_finished_execution_outside_recent_window(sagemak
 
     assert result.exit_code == 0, result.output
     assert "没有正在运行或最近 3 小时内结束" in result.output
+
+
+def test_agent_json_outputs_for_lists_steps_inspect_and_diagnose(
+    monkeypatch,
+    sagemaker_client,
+    logs_client,
+):
+    create_active_processing_job(sagemaker_client, "json-processing")
+    processing_result = runner.invoke(app, ["processing", "list", "--region", REGION, "--json"])
+
+    assert processing_result.exit_code == 0, processing_result.output
+    processing_payload = json.loads(processing_result.output)
+    assert processing_payload["status"] == "ok"
+    assert processing_payload["items"][0]["name"] == "json-processing"
+    assert processing_payload["items"][0]["status"] == "InProgress"
+
+    execution_arn = create_active_pipeline_execution(sagemaker_client, name="json-pipeline")
+    seed_failed_step_logs(logs_client)
+    ctx = context_with_steps(sagemaker_client, logs_client, execution_arn)
+    monkeypatch.setattr(cli_module, "build_contexts", lambda *_args, **_kwargs: [ctx])
+
+    steps_result = runner.invoke(app, ["pipeline", "steps", "--execution-arn", execution_arn, "--json"])
+    assert steps_result.exit_code == 0, steps_result.output
+    steps_payload = json.loads(steps_result.output)
+    assert steps_payload["status"] == "ok"
+    assert [step["StepName"] for step in steps_payload["items"]] == ["PrepareData", "ValidateData"]
+
+    inspect_result = runner.invoke(app, ["pipeline", "inspect", "--execution-arn", execution_arn, "--json"])
+    assert inspect_result.exit_code == 0, inspect_result.output
+    inspect_payload = json.loads(inspect_result.output)
+    assert inspect_payload["status"] == "ok"
+    assert inspect_payload["execution"]["PipelineName"] == "json-pipeline"
+    assert inspect_payload["failed_steps"][0]["StepName"] == "ValidateData"
+
+    diagnose_result = runner.invoke(
+        app,
+        ["pipeline", "diagnose", "--execution-arn", execution_arn, "--log-limit", "10", "--json"],
+    )
+    assert diagnose_result.exit_code == 0, diagnose_result.output
+    diagnosis = json.loads(diagnose_result.output)
+    assert diagnosis["status"] == "ok"
+    assert diagnosis["failed_step"]["StepName"] == "ValidateData"
+    assert diagnosis["job_type"] == "ProcessingJob"
+    assert diagnosis["job_name"] == "failed-processing"
+    assert any("boom: validation failed" in line for line in diagnosis["log_tail"])
+    assert diagnosis["next_actions"][0]["type"] == "inspect"
+
+
+def test_wait_commands_emit_json_for_terminal_jobs(sagemaker_client):
+    sagemaker_client.create_processing_job(**processing_job_spec("wait-processing"))
+    from moto.sagemaker.models import sagemaker_backends
+
+    processing_job = sagemaker_backends[ACCOUNT_ID][REGION].processing_jobs["wait-processing"]
+    processing_job.processing_job_status = "Completed"
+
+    processing_result = runner.invoke(
+        app,
+        ["processing", "wait", "--name", "wait-processing", "--region", REGION, "--timeout", "0", "--json"],
+    )
+    assert processing_result.exit_code == 0, processing_result.output
+    processing_payload = json.loads(processing_result.output)
+    assert processing_payload["status"] == "ok"
+    assert processing_payload["processing_job"]["status"] == "Completed"
+
+    sagemaker_client.create_pipeline(
+        PipelineName="wait-pipeline",
+        RoleArn="arn:aws:iam::123456789012:role/SageMakerExecutionRole",
+        PipelineDefinition='{"Version": "2020-12-01", "Steps": []}',
+    )
+    execution_arn = sagemaker_client.start_pipeline_execution(PipelineName="wait-pipeline")["PipelineExecutionArn"]
+
+    pipeline_result = runner.invoke(
+        app,
+        ["pipeline", "wait", "--execution-arn", execution_arn, "--region", REGION, "--timeout", "0", "--json"],
+    )
+    assert pipeline_result.exit_code == 0, pipeline_result.output
+    pipeline_payload = json.loads(pipeline_result.output)
+    assert pipeline_payload["status"] == "ok"
+    assert pipeline_payload["execution"]["PipelineExecutionStatus"] == "Succeeded"
 
 
 def test_build_contexts_supports_multiple_mock_profiles(aws_mock):

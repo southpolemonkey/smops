@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, is_dataclass
+from datetime import date, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
@@ -13,26 +15,29 @@ from sagemaker_ops.aws import (
     AwsCliError,
     build_contexts,
     describe_pipeline_execution,
+    describe_processing_job,
+    diagnose_pipeline_execution,
     format_dt,
     format_duration,
-    list_active_pipeline_executions,
+    inspect_pipeline_execution,
     list_pipeline_executions_page,
     list_pipeline_steps,
-    list_processing_jobs,
     list_processing_jobs_page,
     load_job_spec,
     parse_parameters,
     start_pipeline_execution,
     submit_processing_job,
+    wait_pipeline_execution,
+    wait_processing_job,
 )
 from sagemaker_ops.tui import ProcessingJobsApp, PipelineExecutionsApp
 
 
 console = Console()
-app = typer.Typer(help="SageMaker Processing Job 与 Pipeline 运维 CLI。", no_args_is_help=True)
-processing_app = typer.Typer(help="提交和查看 SageMaker Processing Job。", no_args_is_help=True)
-pipeline_app = typer.Typer(help="启动和查看 SageMaker Pipeline。", no_args_is_help=True)
-tui_app = typer.Typer(help="交互式 TUI。", no_args_is_help=True)
+app = typer.Typer(help="SageMaker Processing Job and Pipeline operations CLI.", no_args_is_help=True)
+processing_app = typer.Typer(help="Submit and inspect SageMaker Processing Jobs.", no_args_is_help=True)
+pipeline_app = typer.Typer(help="Start and inspect SageMaker Pipelines.", no_args_is_help=True)
+tui_app = typer.Typer(help="Interactive TUI views.", no_args_is_help=True)
 app.add_typer(processing_app, name="processing")
 app.add_typer(pipeline_app, name="pipeline")
 app.add_typer(tui_app, name="tui")
@@ -48,55 +53,112 @@ def version_callback(value: bool) -> None:
 def main(
     version: Annotated[
         bool,
-        typer.Option("--version", callback=version_callback, help="显示版本。"),
+        typer.Option("--version", callback=version_callback, help="Show version."),
     ] = False,
 ) -> None:
     _ = version
 
 
+def _jsonable(value: Any) -> Any:
+    if is_dataclass(value) and not isinstance(value, type):
+        return _jsonable(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return value
+
+
+def _print_json(payload: dict[str, Any]) -> None:
+    console.print_json(json.dumps(_jsonable(payload), default=str))
+
+
+def _exit_error(exc: AwsCliError, json_output: bool) -> None:
+    if json_output:
+        _print_json({"status": "error", "error": str(exc)})
+    else:
+        console.print(f"[red]{exc}[/red]")
+    raise typer.Exit(1) from exc
+
+
 @processing_app.command("submit")
 def processing_submit(
-    config: Annotated[Path, typer.Option("--config", "-c", exists=True, help="create_processing_job 的 JSON/YAML 参数文件。")],
-    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile。")] = None,
-    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region。")] = None,
-    dry_run: Annotated[bool, typer.Option("--dry-run", help="只打印请求，不提交。")] = False,
+    config: Annotated[Path, typer.Option("--config", "-c", exists=True, help="JSON/YAML file using create_processing_job parameters.")],
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Print the request without submitting it.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
 ) -> None:
-    """提交 SageMaker Processing Job。"""
+    """Submit a SageMaker Processing Job."""
     try:
         spec = load_job_spec(config)
         if dry_run:
-            console.print_json(json.dumps(spec, default=str))
+            payload = {"status": "ok", "dry_run": True, "request": spec}
+            if json_output:
+                _print_json(payload)
+            else:
+                console.print_json(json.dumps(_jsonable(spec), default=str))
             return
         ctx = build_contexts((profile,) if profile else (), region)[0]
         response = submit_processing_job(ctx, spec)
     except AwsCliError as exc:
-        console.print(f"[red]{exc}[/red]")
-        raise typer.Exit(1) from exc
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json(
+            {
+                "status": "ok",
+                "profile": ctx.profile,
+                "region": ctx.region,
+                "processing_job_name": spec.get("ProcessingJobName"),
+                "response": response,
+            }
+        )
+        return
     console.print("[green]Processing job 已提交[/green]")
     console.print_json(json.dumps(response, default=str))
 
 
 @processing_app.command("list")
 def processing_list(
-    profile: Annotated[list[str] | None, typer.Option("--profile", "-p", help="AWS profile，可重复传。")] = None,
-    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region。")] = None,
-    all_profiles: Annotated[bool, typer.Option("--all-profiles", help="查看本机所有 AWS profiles。")] = False,
-    max_results: Annotated[int, typer.Option("--max-results", min=1, max=100, help="每页最多读取多少个 running job。")] = 20,
-    next_token: Annotated[str | None, typer.Option("--next-token", help="上一页输出的 Next token。")] = None,
+    profile: Annotated[list[str] | None, typer.Option("--profile", "-p", help="AWS profile. Can be passed multiple times.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    all_profiles: Annotated[bool, typer.Option("--all-profiles", help="Inspect all local AWS profiles.")] = False,
+    max_results: Annotated[int, typer.Option("--max-results", min=1, max=100, help="Max running jobs to read per page.")] = 20,
+    next_token: Annotated[str | None, typer.Option("--next-token", help="Next token printed by the previous page.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
 ) -> None:
-    """按页列出正在运行的 Processing Jobs。"""
+    """List running Processing Jobs one page at a time."""
     try:
-        with console.status("正在查询 SageMaker Processing Jobs..."):
+        if json_output:
             contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
             if next_token and len(contexts) != 1:
                 raise AwsCliError("--next-token 只支持单个 AWS profile 查询")
             pages = [list_processing_jobs_page(ctx, page_size=max_results, next_token=next_token) for ctx in contexts]
-            jobs = [job for page in pages for job in page.jobs]
+        else:
+            with console.status("正在查询 SageMaker Processing Jobs..."):
+                contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
+                if next_token and len(contexts) != 1:
+                    raise AwsCliError("--next-token 只支持单个 AWS profile 查询")
+                pages = [list_processing_jobs_page(ctx, page_size=max_results, next_token=next_token) for ctx in contexts]
+        jobs = [job for page in pages for job in page.jobs]
     except AwsCliError as exc:
-        console.print(f"[red]{exc}[/red]")
-        raise typer.Exit(1) from exc
+        _exit_error(exc, json_output)
 
     next_tokens = [page.next_token for page in pages if page.next_token]
+    if json_output:
+        _print_json(
+            {
+                "status": "ok",
+                "items": jobs,
+                "count": len(jobs),
+                "next_token": next_tokens[0] if len(contexts) == 1 and next_tokens else None,
+            }
+        )
+        return
+
     if not jobs:
         console.print("[yellow]当前查询范围没有正在运行的 processing jobs。[/yellow]")
         if len(contexts) == 1 and next_tokens:
@@ -122,16 +184,42 @@ def processing_list(
         console.print(f"Next token: {next_tokens[0]}")
 
 
+@processing_app.command("wait")
+def processing_wait(
+    name: Annotated[str, typer.Option("--name", "-n", help="Processing Job name.")],
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    timeout: Annotated[int, typer.Option("--timeout", min=0, help="Max seconds to wait.")] = 3600,
+    poll: Annotated[int, typer.Option("--poll", min=1, help="Polling interval in seconds.")] = 30,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """Wait until a Processing Job reaches a terminal state."""
+    try:
+        ctx = build_contexts((profile,) if profile else (), region)[0]
+        job = wait_processing_job(ctx, name, timeout_seconds=timeout, poll_seconds=poll)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    payload = {"status": "ok", "profile": ctx.profile, "region": ctx.region, "processing_job": job}
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(f"[bold]{job.name}[/bold] {job.status}")
+    if job.failure_reason:
+        console.print(job.failure_reason)
+
+
 @pipeline_app.command("start")
 def pipeline_start(
-    name: Annotated[str, typer.Option("--name", "-n", help="SageMaker Pipeline 名称。")],
-    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile。")] = None,
-    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region。")] = None,
-    display_name: Annotated[str | None, typer.Option("--display-name", help="Pipeline execution display name。")] = None,
-    parameter: Annotated[list[str] | None, typer.Option("--parameter", help="Pipeline 参数，格式 NAME=VALUE，可重复传。")] = None,
-    client_request_token: Annotated[str | None, typer.Option("--client-request-token", help="幂等 token。")] = None,
+    name: Annotated[str, typer.Option("--name", "-n", help="SageMaker Pipeline name.")],
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    display_name: Annotated[str | None, typer.Option("--display-name", help="Pipeline execution display name.")] = None,
+    parameter: Annotated[list[str] | None, typer.Option("--parameter", help="Pipeline parameter in NAME=VALUE form. Can be repeated.")] = None,
+    client_request_token: Annotated[str | None, typer.Option("--client-request-token", help="Idempotency token.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
 ) -> None:
-    """启动 SageMaker Pipeline execution。"""
+    """Start a SageMaker Pipeline execution."""
     try:
         ctx = build_contexts((profile,) if profile else (), region)[0]
         response = start_pipeline_execution(
@@ -142,26 +230,39 @@ def pipeline_start(
             client_request_token=client_request_token,
         )
     except AwsCliError as exc:
-        console.print(f"[red]{exc}[/red]")
-        raise typer.Exit(1) from exc
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json(
+            {
+                "status": "ok",
+                "profile": ctx.profile,
+                "region": ctx.region,
+                "pipeline_name": name,
+                "pipeline_execution_arn": response.get("PipelineExecutionArn"),
+                "response": response,
+            }
+        )
+        return
     console.print("[green]Pipeline execution 已启动[/green]")
     console.print_json(json.dumps(response, default=str))
 
 
 @pipeline_app.command("list")
 def pipeline_list(
-    pipeline_name: Annotated[str | None, typer.Option("--name", "-n", help="只查看某个 Pipeline。")] = None,
-    profile: Annotated[list[str] | None, typer.Option("--profile", "-p", help="AWS profile，可重复传。")] = None,
-    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region。")] = None,
-    all_profiles: Annotated[bool, typer.Option("--all-profiles", help="查看本机所有 AWS profiles。")] = False,
-    per_pipeline: Annotated[int, typer.Option("--per-pipeline", min=1, max=100, help="每个 pipeline 最多读取多少个 execution。")] = 10,
-    hours: Annotated[int, typer.Option("--hours", min=1, max=168, help="额外显示最近多少小时内结束的 executions。")] = 3,
-    pipeline_page_size: Annotated[int, typer.Option("--pipeline-page-size", min=1, max=100, help="不传 --name 时每页扫描多少个 pipelines。")] = 10,
-    next_token: Annotated[str | None, typer.Option("--next-token", help="上一页输出的 Next token。")] = None,
+    pipeline_name: Annotated[str | None, typer.Option("--name", "-n", help="Only inspect one Pipeline.")] = None,
+    profile: Annotated[list[str] | None, typer.Option("--profile", "-p", help="AWS profile. Can be passed multiple times.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    all_profiles: Annotated[bool, typer.Option("--all-profiles", help="Inspect all local AWS profiles.")] = False,
+    per_pipeline: Annotated[int, typer.Option("--per-pipeline", min=1, max=100, help="Max executions to read per pipeline.")] = 10,
+    hours: Annotated[int, typer.Option("--hours", min=1, max=168, help="Include executions completed within this many hours.")] = 3,
+    pipeline_page_size: Annotated[int, typer.Option("--pipeline-page-size", min=1, max=100, help="How many pipelines to scan per page when --name is omitted.")] = 10,
+    next_token: Annotated[str | None, typer.Option("--next-token", help="Next token printed by the previous page.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
 ) -> None:
-    """用表格列出正在运行和最近结束的 Pipeline executions。"""
+    """List running and recently completed Pipeline executions."""
     try:
-        with console.status("正在查询 SageMaker Pipeline executions..."):
+        if json_output:
             contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
             if next_token and (len(contexts) != 1 or pipeline_name):
                 raise AwsCliError("--next-token 只支持单个 AWS profile 且不指定 --name 的查询")
@@ -176,12 +277,39 @@ def pipeline_list(
                 )
                 for ctx in contexts
             ]
-            executions = [item for page in pages for item in page.executions]
+        else:
+            with console.status("正在查询 SageMaker Pipeline executions..."):
+                contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
+                if next_token and (len(contexts) != 1 or pipeline_name):
+                    raise AwsCliError("--next-token 只支持单个 AWS profile 且不指定 --name 的查询")
+                pages = [
+                    list_pipeline_executions_page(
+                        ctx,
+                        pipeline_name=pipeline_name,
+                        per_pipeline=per_pipeline,
+                        recent_hours=hours,
+                        pipeline_page_size=pipeline_page_size,
+                        next_token=next_token,
+                    )
+                    for ctx in contexts
+                ]
+        executions = [item for page in pages for item in page.executions]
     except AwsCliError as exc:
-        console.print(f"[red]{exc}[/red]")
-        raise typer.Exit(1) from exc
+        _exit_error(exc, json_output)
 
     next_tokens = [page.next_token for page in pages if page.next_token]
+    if json_output:
+        _print_json(
+            {
+                "status": "ok",
+                "items": executions,
+                "count": len(executions),
+                "recent_hours": hours,
+                "next_token": next_tokens[0] if len(contexts) == 1 and next_tokens else None,
+            }
+        )
+        return
+
     if not executions:
         target = f"Pipeline {pipeline_name}" if pipeline_name else "当前页"
         console.print(f"[yellow]{target} 没有正在运行或最近 {hours} 小时内结束的 pipeline executions。[/yellow]")
@@ -207,18 +335,31 @@ def pipeline_list(
 
 @pipeline_app.command("steps")
 def pipeline_steps(
-    execution_arn: Annotated[str, typer.Option("--execution-arn", "-e", help="Pipeline execution ARN。")],
-    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile。")] = None,
-    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region。")] = None,
+    execution_arn: Annotated[str, typer.Option("--execution-arn", "-e", help="Pipeline execution ARN.")],
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
 ) -> None:
-    """查看某个 Pipeline execution 的 steps。"""
+    """Show steps for one Pipeline execution."""
     try:
         ctx = build_contexts((profile,) if profile else (), region)[0]
         detail = describe_pipeline_execution(ctx, execution_arn)
         steps = list_pipeline_steps(ctx, execution_arn)
     except AwsCliError as exc:
-        console.print(f"[red]{exc}[/red]")
-        raise typer.Exit(1) from exc
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json(
+            {
+                "status": "ok",
+                "profile": ctx.profile,
+                "region": ctx.region,
+                "execution": detail,
+                "items": steps,
+                "count": len(steps),
+            }
+        )
+        return
 
     console.print(f"[bold]{detail.get('PipelineName', '')}[/bold] {detail.get('PipelineExecutionStatus', '')}")
     table = Table("Step", "Type", "Status", "Runtime", "Failure")
@@ -233,30 +374,119 @@ def pipeline_steps(
     console.print(table)
 
 
+@pipeline_app.command("wait")
+def pipeline_wait(
+    execution_arn: Annotated[str, typer.Option("--execution-arn", "-e", help="Pipeline execution ARN.")],
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    timeout: Annotated[int, typer.Option("--timeout", min=0, help="Max seconds to wait.")] = 3600,
+    poll: Annotated[int, typer.Option("--poll", min=1, help="Polling interval in seconds.")] = 30,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """Wait until a Pipeline execution reaches a terminal state."""
+    try:
+        ctx = build_contexts((profile,) if profile else (), region)[0]
+        detail = wait_pipeline_execution(ctx, execution_arn, timeout_seconds=timeout, poll_seconds=poll)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({"status": "ok", "profile": ctx.profile, "region": ctx.region, "execution": detail})
+        return
+    console.print(f"[bold]{detail.get('PipelineName', '')}[/bold] {detail.get('PipelineExecutionStatus', '')}")
+    if detail.get("FailureReason"):
+        console.print(detail["FailureReason"])
+
+
+@pipeline_app.command("inspect")
+def pipeline_inspect(
+    execution_arn: Annotated[str, typer.Option("--execution-arn", "-e", help="Pipeline execution ARN.")],
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """Inspect one Pipeline execution, including steps and failed steps."""
+    try:
+        ctx = build_contexts((profile,) if profile else (), region)[0]
+        inspection = inspect_pipeline_execution(ctx, execution_arn)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({"status": "ok", **inspection})
+        return
+
+    detail = inspection["execution"]
+    console.print(f"[bold]{detail.get('PipelineName', '')}[/bold] {detail.get('PipelineExecutionStatus', '')}")
+    table = Table("Step", "Type", "Status", "Runtime", "Failure")
+    for step in inspection["steps"]:
+        table.add_row(
+            step.get("StepName", ""),
+            step.get("StepType", ""),
+            step.get("StepStatus", ""),
+            format_duration(step.get("StartTime"), step.get("EndTime")),
+            step.get("FailureReason", ""),
+        )
+    console.print(table)
+
+
+@pipeline_app.command("diagnose")
+def pipeline_diagnose(
+    execution_arn: Annotated[str, typer.Option("--execution-arn", "-e", help="Pipeline execution ARN.")],
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    log_limit: Annotated[int, typer.Option("--log-limit", min=1, max=500, help="Max CloudWatch log lines to return.")] = 80,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """Diagnose a Pipeline execution and load logs for the first failed step."""
+    try:
+        ctx = build_contexts((profile,) if profile else (), region)[0]
+        diagnosis = diagnose_pipeline_execution(ctx, execution_arn, log_limit=log_limit)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({"status": "ok", **diagnosis})
+        return
+
+    detail = diagnosis["execution"]
+    failed_step = diagnosis["failed_step"]
+    console.print(f"[bold]{detail.get('PipelineName', '')}[/bold] {detail.get('PipelineExecutionStatus', '')}")
+    if not failed_step:
+        console.print("[green]No failed step found.[/green]")
+        return
+    console.print(f"[red]Failed step:[/red] {failed_step.get('StepName', '')}")
+    if failed_step.get("FailureReason"):
+        console.print(failed_step["FailureReason"])
+    if diagnosis.get("log_group"):
+        console.print(f"Logs: {diagnosis['log_group']} / {diagnosis['log_stream_prefix']}")
+    for line in diagnosis["log_tail"]:
+        console.print(line)
+
+
 @tui_app.command("processing")
 def tui_processing(
-    profile: Annotated[list[str] | None, typer.Option("--profile", "-p", help="AWS profile，可重复传。")] = None,
-    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region。")] = None,
-    all_profiles: Annotated[bool, typer.Option("--all-profiles", help="查看本机所有 AWS profiles。")] = False,
-    refresh: Annotated[int, typer.Option("--refresh", min=5, max=300, help="刷新间隔秒数。")] = 15,
+    profile: Annotated[list[str] | None, typer.Option("--profile", "-p", help="AWS profile. Can be passed multiple times.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    all_profiles: Annotated[bool, typer.Option("--all-profiles", help="Inspect all local AWS profiles.")] = False,
+    refresh: Annotated[int, typer.Option("--refresh", min=5, max=300, help="Refresh interval in seconds.")] = 15,
 ) -> None:
-    """交互式查看正在运行的 Processing Jobs。"""
+    """Interactively inspect running Processing Jobs."""
     ProcessingJobsApp(tuple(profile or ()), region, all_profiles, refresh).run()
 
 
 @tui_app.command("pipelines")
 def tui_pipelines(
-    pipeline_name: Annotated[str | None, typer.Option("--name", "-n", help="只查看某个 Pipeline。")] = None,
-    profile: Annotated[list[str] | None, typer.Option("--profile", "-p", help="AWS profile，可重复传。")] = None,
-    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region。")] = None,
-    all_profiles: Annotated[bool, typer.Option("--all-profiles", help="查看本机所有 AWS profiles。")] = False,
-    refresh: Annotated[int, typer.Option("--refresh", min=5, max=300, help="刷新间隔秒数。")] = 15,
-    hours: Annotated[int, typer.Option("--hours", min=1, max=168, help="额外显示最近多少小时内结束的 executions。")] = 3,
+    pipeline_name: Annotated[str | None, typer.Option("--name", "-n", help="Only inspect one Pipeline.")] = None,
+    profile: Annotated[list[str] | None, typer.Option("--profile", "-p", help="AWS profile. Can be passed multiple times.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    all_profiles: Annotated[bool, typer.Option("--all-profiles", help="Inspect all local AWS profiles.")] = False,
+    refresh: Annotated[int, typer.Option("--refresh", min=5, max=300, help="Refresh interval in seconds.")] = 15,
+    hours: Annotated[int, typer.Option("--hours", min=1, max=168, help="Include executions completed within this many hours.")] = 3,
 ) -> None:
-    """交互式查看正在运行和最近结束的 Pipeline executions、steps 和失败日志。"""
+    """Interactively inspect running and recently completed Pipeline executions, steps, and failed logs."""
     PipelineExecutionsApp(tuple(profile or ()), region, all_profiles, refresh, pipeline_name, hours).run()
 
 
 if __name__ == "__main__":
     app()
-
