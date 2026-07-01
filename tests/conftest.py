@@ -62,6 +62,8 @@ def fake_aws_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
     monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
     monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("SMOPS_CONFIG_FILE", raising=False)
+    monkeypatch.delenv("SMOPS_DEFAULT_REGION", raising=False)
 
 
 @pytest.fixture(autouse=True)

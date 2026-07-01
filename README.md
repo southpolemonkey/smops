@@ -65,6 +65,29 @@ To enable YAML config files:
 pip install -e '.[yaml]'
 ```
 
+## Defaults
+
+Set a default AWS region once so you do not need to pass `--region` on every command:
+
+```bash
+smops config set-region ap-southeast-2
+smops config get-region
+```
+
+The config file is stored at `~/.config/smops/config.json` by default. You can inspect it with:
+
+```bash
+smops config show
+smops config path
+```
+
+Region resolution order is:
+
+1. `--region`
+2. `SMOPS_DEFAULT_REGION`
+3. `smops config set-region ...`
+4. Region configured on the selected AWS profile
+
 ## Build The Python Package
 
 ```bash

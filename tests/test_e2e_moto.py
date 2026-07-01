@@ -214,6 +214,47 @@ def test_pipeline_list_excludes_finished_execution_outside_recent_window(sagemak
     assert "没有正在运行或最近 3 小时内结束" in result.output
 
 
+def test_smops_default_region_config_is_used_by_cli(monkeypatch, tmp_path):
+    config_file = tmp_path / "smops-config.json"
+    monkeypatch.setenv("SMOPS_CONFIG_FILE", str(config_file))
+
+    set_result = runner.invoke(app, ["config", "set-region", "ap-southeast-2", "--json"])
+    assert set_result.exit_code == 0, set_result.output
+    set_payload = json.loads(set_result.output)
+    assert set_payload["default_region"] == "ap-southeast-2"
+    assert config_file.exists()
+
+    get_result = runner.invoke(app, ["config", "get-region", "--json"])
+    assert get_result.exit_code == 0, get_result.output
+    assert json.loads(get_result.output)["default_region"] == "ap-southeast-2"
+
+    seen = {}
+
+    def fake_build_contexts(profiles, region, all_profiles=False):
+        seen["profiles"] = profiles
+        seen["region"] = region
+        seen["all_profiles"] = all_profiles
+        return []
+
+    monkeypatch.setattr(cli_module, "build_contexts", fake_build_contexts)
+    list_result = runner.invoke(app, ["processing", "list", "--json"])
+
+    assert list_result.exit_code == 0, list_result.output
+    assert seen["region"] == "ap-southeast-2"
+
+
+def test_smops_default_region_env_overrides_config(monkeypatch, tmp_path):
+    config_file = tmp_path / "smops-config.json"
+    monkeypatch.setenv("SMOPS_CONFIG_FILE", str(config_file))
+    assert runner.invoke(app, ["config", "set-region", "us-east-1"]).exit_code == 0
+    monkeypatch.setenv("SMOPS_DEFAULT_REGION", "ap-southeast-2")
+
+    result = runner.invoke(app, ["config", "get-region", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["default_region"] == "ap-southeast-2"
+
+
 def test_agent_json_outputs_for_lists_steps_inspect_and_diagnose(
     monkeypatch,
     sagemaker_client,

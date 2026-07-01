@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from sagemaker_ops import __version__
+from sagemaker_ops.config import config_path, get_default_region, load_config, resolve_region, set_default_region
 from sagemaker_ops.aws import (
     AwsCliError,
     build_contexts,
@@ -38,9 +39,11 @@ app = typer.Typer(help="SageMaker Processing Job and Pipeline operations CLI.", 
 processing_app = typer.Typer(help="Submit and inspect SageMaker Processing Jobs.", no_args_is_help=True)
 pipeline_app = typer.Typer(help="Start and inspect SageMaker Pipelines.", no_args_is_help=True)
 tui_app = typer.Typer(help="Interactive TUI views.", no_args_is_help=True)
+config_app = typer.Typer(help="Manage smops defaults.", no_args_is_help=True)
 app.add_typer(processing_app, name="processing")
 app.add_typer(pipeline_app, name="pipeline")
 app.add_typer(tui_app, name="tui")
+app.add_typer(config_app, name="config")
 
 
 def version_callback(value: bool) -> None:
@@ -83,6 +86,78 @@ def _exit_error(exc: AwsCliError, json_output: bool) -> None:
     raise typer.Exit(1) from exc
 
 
+def _effective_region(region: str | None) -> str | None:
+    try:
+        return resolve_region(region)
+    except ValueError as exc:
+        raise AwsCliError(str(exc)) from exc
+
+
+@config_app.command("set-region")
+def config_set_region(
+    region: Annotated[str, typer.Argument(help="Default AWS region for smops commands.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """Set the default AWS region used by smops."""
+    try:
+        set_default_region(region)
+    except ValueError as exc:
+        _exit_error(AwsCliError(str(exc)), json_output)
+    payload = {"status": "ok", "default_region": region, "config_path": str(config_path())}
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(f"Default region set to [bold]{region}[/bold]")
+    console.print(f"Config: {config_path()}")
+
+
+@config_app.command("get-region")
+def config_get_region(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """Print the configured default AWS region."""
+    try:
+        region = get_default_region()
+    except ValueError as exc:
+        _exit_error(AwsCliError(str(exc)), json_output)
+    payload = {"status": "ok", "default_region": region, "config_path": str(config_path())}
+    if json_output:
+        _print_json(payload)
+        return
+    if region:
+        console.print(region)
+    else:
+        console.print("No default region configured.")
+
+
+@config_app.command("show")
+def config_show(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """Show smops configuration."""
+    try:
+        config = load_config()
+        region = get_default_region()
+    except ValueError as exc:
+        _exit_error(AwsCliError(str(exc)), json_output)
+    payload = {
+        "status": "ok",
+        "config_path": str(config_path()),
+        "default_region": region,
+        "config": config,
+    }
+    if json_output:
+        _print_json(payload)
+        return
+    console.print_json(json.dumps(_jsonable(payload), default=str))
+
+
+@config_app.command("path")
+def config_path_command() -> None:
+    """Print the smops config file path."""
+    console.print(str(config_path()))
+
+
 @processing_app.command("submit")
 def processing_submit(
     config: Annotated[Path, typer.Option("--config", "-c", exists=True, help="JSON/YAML file using create_processing_job parameters.")],
@@ -101,7 +176,7 @@ def processing_submit(
             else:
                 console.print_json(json.dumps(_jsonable(spec), default=str))
             return
-        ctx = build_contexts((profile,) if profile else (), region)[0]
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
         response = submit_processing_job(ctx, spec)
     except AwsCliError as exc:
         _exit_error(exc, json_output)
@@ -133,13 +208,13 @@ def processing_list(
     """List running Processing Jobs one page at a time."""
     try:
         if json_output:
-            contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
+            contexts = build_contexts(tuple(profile or ()), _effective_region(region), all_profiles=all_profiles)
             if next_token and len(contexts) != 1:
                 raise AwsCliError("--next-token 只支持单个 AWS profile 查询")
             pages = [list_processing_jobs_page(ctx, page_size=max_results, next_token=next_token) for ctx in contexts]
         else:
             with console.status("正在查询 SageMaker Processing Jobs..."):
-                contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
+                contexts = build_contexts(tuple(profile or ()), _effective_region(region), all_profiles=all_profiles)
                 if next_token and len(contexts) != 1:
                     raise AwsCliError("--next-token 只支持单个 AWS profile 查询")
                 pages = [list_processing_jobs_page(ctx, page_size=max_results, next_token=next_token) for ctx in contexts]
@@ -195,7 +270,7 @@ def processing_wait(
 ) -> None:
     """Wait until a Processing Job reaches a terminal state."""
     try:
-        ctx = build_contexts((profile,) if profile else (), region)[0]
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
         job = wait_processing_job(ctx, name, timeout_seconds=timeout, poll_seconds=poll)
     except AwsCliError as exc:
         _exit_error(exc, json_output)
@@ -221,7 +296,7 @@ def pipeline_start(
 ) -> None:
     """Start a SageMaker Pipeline execution."""
     try:
-        ctx = build_contexts((profile,) if profile else (), region)[0]
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
         response = start_pipeline_execution(
             ctx,
             pipeline_name=name,
@@ -263,7 +338,7 @@ def pipeline_list(
     """List running and recently completed Pipeline executions."""
     try:
         if json_output:
-            contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
+            contexts = build_contexts(tuple(profile or ()), _effective_region(region), all_profiles=all_profiles)
             if next_token and (len(contexts) != 1 or pipeline_name):
                 raise AwsCliError("--next-token 只支持单个 AWS profile 且不指定 --name 的查询")
             pages = [
@@ -279,7 +354,7 @@ def pipeline_list(
             ]
         else:
             with console.status("正在查询 SageMaker Pipeline executions..."):
-                contexts = build_contexts(tuple(profile or ()), region, all_profiles=all_profiles)
+                contexts = build_contexts(tuple(profile or ()), _effective_region(region), all_profiles=all_profiles)
                 if next_token and (len(contexts) != 1 or pipeline_name):
                     raise AwsCliError("--next-token 只支持单个 AWS profile 且不指定 --name 的查询")
                 pages = [
@@ -342,7 +417,7 @@ def pipeline_steps(
 ) -> None:
     """Show steps for one Pipeline execution."""
     try:
-        ctx = build_contexts((profile,) if profile else (), region)[0]
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
         detail = describe_pipeline_execution(ctx, execution_arn)
         steps = list_pipeline_steps(ctx, execution_arn)
     except AwsCliError as exc:
@@ -385,7 +460,7 @@ def pipeline_wait(
 ) -> None:
     """Wait until a Pipeline execution reaches a terminal state."""
     try:
-        ctx = build_contexts((profile,) if profile else (), region)[0]
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
         detail = wait_pipeline_execution(ctx, execution_arn, timeout_seconds=timeout, poll_seconds=poll)
     except AwsCliError as exc:
         _exit_error(exc, json_output)
@@ -407,7 +482,7 @@ def pipeline_inspect(
 ) -> None:
     """Inspect one Pipeline execution, including steps and failed steps."""
     try:
-        ctx = build_contexts((profile,) if profile else (), region)[0]
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
         inspection = inspect_pipeline_execution(ctx, execution_arn)
     except AwsCliError as exc:
         _exit_error(exc, json_output)
@@ -440,7 +515,7 @@ def pipeline_diagnose(
 ) -> None:
     """Diagnose a Pipeline execution and load logs for the first failed step."""
     try:
-        ctx = build_contexts((profile,) if profile else (), region)[0]
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
         diagnosis = diagnose_pipeline_execution(ctx, execution_arn, log_limit=log_limit)
     except AwsCliError as exc:
         _exit_error(exc, json_output)
@@ -472,7 +547,7 @@ def tui_processing(
     refresh: Annotated[int, typer.Option("--refresh", min=5, max=300, help="Refresh interval in seconds.")] = 15,
 ) -> None:
     """Interactively inspect running Processing Jobs."""
-    ProcessingJobsApp(tuple(profile or ()), region, all_profiles, refresh).run()
+    ProcessingJobsApp(tuple(profile or ()), _effective_region(region), all_profiles, refresh).run()
 
 
 @tui_app.command("pipelines")
@@ -485,7 +560,7 @@ def tui_pipelines(
     hours: Annotated[int, typer.Option("--hours", min=1, max=168, help="Include executions completed within this many hours.")] = 3,
 ) -> None:
     """Interactively inspect running and recently completed Pipeline executions, steps, and failed logs."""
-    PipelineExecutionsApp(tuple(profile or ()), region, all_profiles, refresh, pipeline_name, hours).run()
+    PipelineExecutionsApp(tuple(profile or ()), _effective_region(region), all_profiles, refresh, pipeline_name, hours).run()
 
 
 if __name__ == "__main__":
