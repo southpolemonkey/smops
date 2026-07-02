@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -326,10 +327,7 @@ def list_pipeline_executions_page(
         next_token=next_token,
     )
     cutoff = datetime.now(timezone.utc) - timedelta(hours=recent_hours)
-    executions: list[PipelineExecutionView] = []
-
-    for name in names:
-        executions.extend(_list_recent_pipeline_executions_for_name(ctx, name, per_pipeline, cutoff))
+    executions = _list_recent_pipeline_executions(ctx, names, per_pipeline, cutoff)
 
     return PipelineExecutionsPage(
         executions=sorted(
@@ -339,6 +337,29 @@ def list_pipeline_executions_page(
         ),
         next_token=output_next_token,
     )
+
+
+def _list_recent_pipeline_executions(
+    ctx: AwsContext,
+    pipeline_names: list[str],
+    per_pipeline: int,
+    cutoff: datetime,
+) -> list[PipelineExecutionView]:
+    if not pipeline_names:
+        return []
+    if len(pipeline_names) == 1:
+        return _list_recent_pipeline_executions_for_name(ctx, pipeline_names[0], per_pipeline, cutoff)
+
+    executions: list[PipelineExecutionView] = []
+    workers = min(8, len(pipeline_names))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(_list_recent_pipeline_executions_for_name, ctx, name, per_pipeline, cutoff)
+            for name in pipeline_names
+        ]
+        for future in as_completed(futures):
+            executions.extend(future.result())
+    return executions
 
 
 def _list_recent_pipeline_executions_for_name(
@@ -362,18 +383,17 @@ def _list_recent_pipeline_executions_for_name(
     for summary in response.get("PipelineExecutionSummaries", []):
         status = summary.get("PipelineExecutionStatus", "")
         execution_arn = summary.get("PipelineExecutionArn", "")
-        detail = _describe_pipeline_execution_safely(ctx, execution_arn) if execution_arn else {}
-        start_time = detail.get("StartTime", summary.get("StartTime"))
-        last_modified_time = detail.get("LastModifiedTime", summary.get("LastModifiedTime"))
+        start_time = summary.get("StartTime")
+        last_modified_time = summary.get("LastModifiedTime")
         if not _should_show_pipeline_execution(status, start_time, last_modified_time, cutoff):
             continue
         executions.append(
             PipelineExecutionView(
                 profile=ctx.profile,
                 region=ctx.region,
-                pipeline_name=detail.get("PipelineName", pipeline_name),
+                pipeline_name=pipeline_name,
                 execution_arn=execution_arn,
-                display_name=summary.get("PipelineExecutionDisplayName", detail.get("PipelineExecutionDisplayName", "")),
+                display_name=summary.get("PipelineExecutionDisplayName", ""),
                 status=status,
                 start_time=start_time,
                 last_modified_time=last_modified_time,

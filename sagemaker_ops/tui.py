@@ -9,6 +9,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, RichLog, Static
+from textual.worker import Worker, WorkerState
 
 PROFILE_PICKER_VISIBLE_ROWS = 16
 
@@ -430,6 +431,8 @@ class PipelineExecutionsApp(BaseSageMakerApp):
         self._updating_steps = False
         self._suppress_next_execution_highlight = False
         self._suppress_next_step_highlight = False
+        self._refresh_previous_execution_arn: str | None = None
+        self._refresh_previous_step_name: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -453,27 +456,54 @@ class PipelineExecutionsApp(BaseSageMakerApp):
         executions.add_columns("Profile", "Region", "Pipeline", "Execution", "Status", "Runtime")
         steps = self.query_one("#steps", DataTable)
         steps.add_columns("Step", "Type", "Status", "Runtime", "Failure")
-        super().on_mount()
+        self.query_one("#logs", RichLog).write("Loading pipeline executions...")
+        self.set_interval(self.refresh_seconds, self.action_refresh)
+        self.call_after_refresh(self.action_refresh)
 
     def action_refresh(self) -> None:
-        previous_execution_arn = self.selected_execution_arn
-        previous_step_name = self.selected_step_name()
-        try:
-            pairs: list[tuple[AwsContext, PipelineExecutionView]] = []
-            for ctx in self.load_contexts():
-                for execution in list_active_pipeline_executions(
-                    ctx, pipeline_name=self.pipeline_name, recent_hours=self.recent_hours
-                ):
-                    pairs.append((ctx, execution))
-            self.executions = pairs
-            self.render_executions(previous_execution_arn, previous_step_name, preserve_logs=True)
-            self.query_one("#status", Static).update(
-                f"{len(self.executions)} active/recent pipeline execution(s), window={self.recent_hours}h. "
-                f"Profile: {self.profile_label()}. "
-                "Use left/right to switch panes, P to choose profile, s to start, l to load logs."
-            )
-        except AwsCliError as exc:
-            self.show_error(exc)
+        self._refresh_previous_execution_arn = self.selected_execution_arn
+        self._refresh_previous_step_name = self.selected_step_name()
+        self.query_one("#status", Static).update(
+            f"Loading pipeline executions, window={self.recent_hours}h. "
+            f"Profile: {self.profile_label()}."
+        )
+        self.run_worker(
+            self._load_pipeline_execution_pairs,
+            name="pipeline-refresh",
+            group="pipeline-refresh",
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def _load_pipeline_execution_pairs(self) -> list[tuple[AwsContext, PipelineExecutionView]]:
+        pairs: list[tuple[AwsContext, PipelineExecutionView]] = []
+        for ctx in self.load_contexts():
+            for execution in list_active_pipeline_executions(
+                ctx, pipeline_name=self.pipeline_name, recent_hours=self.recent_hours
+            ):
+                pairs.append((ctx, execution))
+        return pairs
+
+    @on(Worker.StateChanged)
+    def on_pipeline_refresh_worker_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker.name != "pipeline-refresh" or event.state not in {WorkerState.SUCCESS, WorkerState.ERROR}:
+            return
+        if event.state == WorkerState.ERROR:
+            exc = event.worker.error
+            self.show_error(exc if isinstance(exc, Exception) else AwsCliError(str(exc)))
+            return
+        self.executions = event.worker.result
+        self.render_executions(
+            self._refresh_previous_execution_arn,
+            self._refresh_previous_step_name,
+            preserve_logs=True,
+        )
+        self.query_one("#status", Static).update(
+            f"{len(self.executions)} active/recent pipeline execution(s), window={self.recent_hours}h. "
+            f"Profile: {self.profile_label()}. "
+            "Use left/right to switch panes, P to choose profile, s to start, l to load logs."
+        )
 
     def action_focus_executions(self) -> None:
         self.query_one("#executions", DataTable).focus()

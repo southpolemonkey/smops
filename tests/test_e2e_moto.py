@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 
 from textual.widgets import DataTable, RichLog, Static
 from typer.testing import CliRunner
@@ -36,6 +38,40 @@ from .conftest import (
 
 
 runner = CliRunner()
+
+
+class NoDescribePipelineClient:
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+
+    def __getattr__(self, name):
+        return getattr(self.wrapped, name)
+
+    def describe_pipeline_execution(self, **_kwargs):
+        raise AssertionError("pipeline listing should not describe each execution")
+
+
+class SlowPipelineListClient:
+    def __init__(self, wrapped, delay_seconds: float = 0.05):
+        self.wrapped = wrapped
+        self.delay_seconds = delay_seconds
+        self.active_calls = 0
+        self.max_active_calls = 0
+        self.lock = Lock()
+
+    def __getattr__(self, name):
+        return getattr(self.wrapped, name)
+
+    def list_pipeline_executions(self, **kwargs):
+        with self.lock:
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            time.sleep(self.delay_seconds)
+            return self.wrapped.list_pipeline_executions(**kwargs)
+        finally:
+            with self.lock:
+                self.active_calls -= 1
 
 
 def test_processing_submit_and_running_list_cli_with_moto(processing_spec, sagemaker_client):
@@ -200,6 +236,41 @@ def test_pipeline_list_paginates_pipeline_names_without_name(sagemaker_client, l
     cli_first_page = runner.invoke(app, ["pipeline", "list", "--region", REGION, "--pipeline-page-size", "1"])
     assert cli_first_page.exit_code == 0, cli_first_page.output
     assert "Next token:" in cli_first_page.output
+
+
+def test_pipeline_list_uses_summaries_without_describing_each_execution(sagemaker_client, logs_client):
+    for name in ["summary-pipeline-a", "summary-pipeline-b"]:
+        sagemaker_client.create_pipeline(
+            PipelineName=name,
+            RoleArn="arn:aws:iam::123456789012:role/SageMakerExecutionRole",
+            PipelineDefinition='{"Version": "2020-12-01", "Steps": []}',
+        )
+        sagemaker_client.start_pipeline_execution(PipelineName=name)
+    ctx = context_with_steps(sagemaker_client, logs_client, "unused")
+    ctx = ctx.__class__(ctx.profile, ctx.region, NoDescribePipelineClient(ctx.sagemaker), ctx.logs)
+
+    page = list_pipeline_executions_page(ctx, pipeline_page_size=2)
+
+    assert len(page.executions) == 2
+
+
+def test_pipeline_list_scans_pipeline_executions_concurrently(sagemaker_client, logs_client):
+    for index in range(4):
+        name = f"concurrent-pipeline-{index}"
+        sagemaker_client.create_pipeline(
+            PipelineName=name,
+            RoleArn="arn:aws:iam::123456789012:role/SageMakerExecutionRole",
+            PipelineDefinition='{"Version": "2020-12-01", "Steps": []}',
+        )
+        sagemaker_client.start_pipeline_execution(PipelineName=name)
+    ctx = context_with_steps(sagemaker_client, logs_client, "unused")
+    slow_client = SlowPipelineListClient(ctx.sagemaker)
+    ctx = ctx.__class__(ctx.profile, ctx.region, slow_client, ctx.logs)
+
+    page = list_pipeline_executions_page(ctx, pipeline_page_size=4)
+
+    assert len(page.executions) == 4
+    assert slow_client.max_active_calls > 1
 
 
 def test_pipeline_list_excludes_finished_execution_outside_recent_window(sagemaker_client):
@@ -583,6 +654,23 @@ def test_processing_tui_loads_selected_job_logs(monkeypatch, sagemaker_client, l
 
             assert app_under_test.loaded_processing_log_key == ("mock-dev", REGION, "processing-with-logs")
             assert any("boom: validation failed" in line for line in tail_processing_job_logs(ctx, "processing-with-logs"))
+
+    asyncio.run(run_app())
+
+
+def test_pipeline_tui_shows_loading_state_before_refresh_finishes(monkeypatch):
+    def slow_build_contexts(*_args, **_kwargs):
+        time.sleep(0.2)
+        return []
+
+    monkeypatch.setattr(tui_module, "build_contexts", slow_build_contexts)
+
+    async def run_app() -> None:
+        app_under_test = PipelineExecutionsApp(("mock-dev",), REGION, False, 60, "slow-pipeline")
+        async with app_under_test.run_test(size=(140, 40)) as pilot:
+            await pilot.pause(0.01)
+            status = app_under_test.query_one("#status", Static).content
+            assert "Loading pipeline executions" in str(status)
 
     asyncio.run(run_app())
 
