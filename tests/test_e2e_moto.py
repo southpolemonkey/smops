@@ -4,12 +4,13 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 
-from textual.widgets import DataTable
+from textual.widgets import DataTable, Static
 from typer.testing import CliRunner
 
 import sagemaker_ops.cli as cli_module
 import sagemaker_ops.tui as tui_module
 from sagemaker_ops.aws import (
+    AwsCliError,
     build_contexts,
     list_active_pipeline_executions,
     list_pipeline_executions_page,
@@ -385,8 +386,44 @@ def test_processing_tui_switches_profile_with_picker(monkeypatch, sagemaker_clie
             await pilot.pause()
             await pilot.press("p")
             await pilot.pause()
+            assert app_under_test.screen.__class__.__name__ == "ProfileSelectScreen"
+            profiles_view = app_under_test.screen.query_one("#profiles", Static)
+            assert "mock-dev (current)" in str(profiles_view.content)
+            assert "mock-prod" in str(profiles_view.content)
+            assert app_under_test.profiles == ("mock-dev",)
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
             assert app_under_test.profiles == ("mock-prod",)
             assert app_under_test.all_profiles is False
+
+    asyncio.run(run_app())
+
+
+def test_processing_tui_keeps_current_profile_when_selected_profile_fails(monkeypatch, sagemaker_client, logs_client):
+    create_active_processing_job(sagemaker_client, "profile-processing")
+    ctx = context_with_steps(sagemaker_client, logs_client, "unused")
+    monkeypatch.setattr(tui_module, "available_profiles", lambda: ["mock-dev", "bad-sso", "mock-prod"])
+
+    def fake_build_contexts(profiles, *_args, **_kwargs):
+        if profiles == ("bad-sso",):
+            raise AwsCliError("custom-process: SSO ForbiddenException: No access")
+        return [ctx]
+
+    monkeypatch.setattr(tui_module, "build_contexts", fake_build_contexts)
+
+    async def run_app() -> None:
+        app_under_test = ProcessingJobsApp(("mock-dev",), REGION, False, 60)
+        async with app_under_test.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app_under_test.profiles == ("mock-dev",)
+            status = app_under_test.query_one("#status", Static).content
+            assert "ForbiddenException" in str(status)
 
     asyncio.run(run_app())
 

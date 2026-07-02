@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from textual import on
+from textual import events, on
 from textual.binding import Binding
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -91,6 +91,11 @@ class BaseSageMakerApp(App[None]):
     #home {
         height: 1fr;
     }
+
+    #profiles {
+        height: 16;
+        margin-bottom: 1;
+    }
     """
 
     BINDINGS = [
@@ -127,6 +132,23 @@ class BaseSageMakerApp(App[None]):
         self.query_one("#status", Static).update(f"[red]{exc}[/red]")
 
     def on_key(self, event) -> None:
+        if isinstance(self.screen, ProfileSelectScreen):
+            if event.key in {"down", "j"}:
+                event.stop()
+                self.screen.action_next_profile()
+                return
+            if event.key in {"up", "k"}:
+                event.stop()
+                self.screen.action_previous_profile()
+                return
+            if event.key == "enter":
+                event.stop()
+                self.screen.action_select_profile()
+                return
+            if event.key == "escape":
+                event.stop()
+                self.screen.action_cancel()
+                return
         if event.key in {"p", "P"}:
             event.stop()
             self.action_switch_profile()
@@ -151,22 +173,31 @@ class BaseSageMakerApp(App[None]):
         if not profiles:
             self.show_error(AwsCliError("No AWS profiles found."))
             return
-        current = self.profiles[0] if self.profiles else None
-        try:
-            current_index = profiles.index(current) if current else -1
-        except ValueError:
-            current_index = -1
-        next_profile = profiles[(current_index + 1) % len(profiles)]
-        self.apply_profile(next_profile)
+        self.push_screen(ProfileSelectScreen(profiles, self.current_profile()), self.apply_profile)
 
-    def apply_profile(self, profile: str | None) -> None:
+    def apply_profile(self, profile: str | None, contexts: list[AwsContext] | None = None) -> None:
         if not profile:
             return
-        self.profiles = (profile,)
-        self.all_profiles = False
-        self.contexts = []
-        self.query_one("#status", Static).update(f"Switched profile to {profile}.")
-        self.action_refresh()
+        try:
+            self.contexts = contexts or build_contexts((profile,), self.region, all_profiles=False)
+            self.profiles = (profile,)
+            self.all_profiles = False
+            self.query_one("#status", Static).update(f"Switched profile to {profile}.")
+            self.action_refresh()
+        except AwsCliError as exc:
+            self.contexts = []
+            self.show_error(exc)
+
+    def current_profile(self) -> str | None:
+        if self.all_profiles:
+            return None
+        return self.profiles[0] if self.profiles else None
+
+    def profile_label(self) -> str:
+        if self.all_profiles:
+            return "all profiles"
+        profile = self.current_profile()
+        return profile or "default"
 
 
 class ProcessingJobsApp(BaseSageMakerApp):
@@ -210,17 +241,24 @@ class ProcessingJobsApp(BaseSageMakerApp):
             self.render_jobs()
             self.query_one("#status", Static).update(
                 f"{len(self.jobs)} running processing job(s). Refresh every {self.refresh_seconds}s. "
-                "Use arrows to move, P to switch profile, s to submit, r to refresh, q to quit."
+                f"Profile: {self.profile_label()}. "
+                "Use arrows to move, P to choose profile, s to submit, r to refresh, q to quit."
             )
         except AwsCliError as exc:
             self.show_error(exc)
 
     def action_previous_job(self) -> None:
+        if isinstance(self.screen, ProfileSelectScreen):
+            self.screen.action_previous_profile()
+            return
         table = self.query_one("#jobs", DataTable)
         if table.row_count:
             table.move_cursor(row=max(0, table.cursor_row - 1))
 
     def action_next_job(self) -> None:
+        if isinstance(self.screen, ProfileSelectScreen):
+            self.screen.action_next_profile()
+            return
         table = self.query_one("#jobs", DataTable)
         if table.row_count:
             table.move_cursor(row=min(table.row_count - 1, table.cursor_row + 1))
@@ -364,7 +402,8 @@ class PipelineExecutionsApp(BaseSageMakerApp):
             self.render_executions(previous_execution_arn, previous_step_name, preserve_logs=True)
             self.query_one("#status", Static).update(
                 f"{len(self.executions)} active/recent pipeline execution(s), window={self.recent_hours}h. "
-                "Use left/right to switch panes, P to switch profile, s to start, l to load logs."
+                f"Profile: {self.profile_label()}. "
+                "Use left/right to switch panes, P to choose profile, s to start, l to load logs."
             )
         except AwsCliError as exc:
             self.show_error(exc)
@@ -625,6 +664,77 @@ class PipelineStartScreen(ModalScreen[dict[str, str] | None]):
     @on(Button.Pressed, "#cancel")
     def cancel(self) -> None:
         self.dismiss(None)
+
+
+class ProfileSelectScreen(ModalScreen[str | None]):
+    BINDINGS = [
+        Binding("up", "previous_profile", "Previous", priority=True),
+        Binding("k", "previous_profile", "Previous", priority=True, show=False),
+        Binding("down", "next_profile", "Next", priority=True),
+        Binding("j", "next_profile", "Next", priority=True, show=False),
+        Binding("enter", "select_profile", "Select", priority=True),
+        Binding("escape", "cancel", "Cancel", priority=True),
+    ]
+
+    def __init__(self, profiles: list[str], current_profile: str | None) -> None:
+        super().__init__()
+        self.profiles = profiles
+        self.current_profile = current_profile
+        self.selected_index = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label(f"Choose AWS profile. Current: {self.current_profile or 'default/all profiles'}")
+            yield Static("", id="profiles")
+
+    def on_mount(self) -> None:
+        for index, profile in enumerate(self.profiles):
+            if profile == self.current_profile:
+                self.selected_index = index
+                break
+        self.render_profiles()
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key in {"down", "j"}:
+            event.stop()
+            self.action_next_profile()
+        elif event.key in {"up", "k"}:
+            event.stop()
+            self.action_previous_profile()
+        elif event.key == "enter":
+            event.stop()
+            self.action_select_profile()
+        elif event.key == "escape":
+            event.stop()
+            self.action_cancel()
+
+    def action_previous_profile(self) -> None:
+        if self.profiles:
+            self.selected_index = max(0, self.selected_index - 1)
+            self.render_profiles()
+
+    def action_next_profile(self) -> None:
+        if self.profiles:
+            self.selected_index = min(len(self.profiles) - 1, self.selected_index + 1)
+            self.render_profiles()
+
+    def action_select_profile(self) -> None:
+        if not self.profiles:
+            self.dismiss(None)
+            return
+        self.dismiss(self.profiles[self.selected_index])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def render_profiles(self) -> None:
+        lines = []
+        for index, profile in enumerate(self.profiles):
+            cursor = ">" if index == self.selected_index else " "
+            marker = " (current)" if profile == self.current_profile else ""
+            lines.append(f"{cursor} {profile}{marker}")
+        self.query_one("#profiles", Static).update("\n".join(lines))
+
 
 
 class ProcessingSubmitScreen(ModalScreen[str | None]):
