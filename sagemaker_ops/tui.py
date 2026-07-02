@@ -10,6 +10,9 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, RichLog, Static
 
+PROFILE_PICKER_VISIBLE_ROWS = 16
+
+
 from sagemaker_ops.aws import (
     AwsCliError,
     AwsContext,
@@ -681,6 +684,7 @@ class ProfileSelectScreen(ModalScreen[str | None]):
         self.profiles = profiles
         self.current_profile = current_profile
         self.selected_index = 0
+        self.visible_start = 0
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog"):
@@ -728,13 +732,26 @@ class ProfileSelectScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
     def render_profiles(self) -> None:
+        self._keep_selection_visible()
+        visible_end = min(len(self.profiles), self.visible_start + PROFILE_PICKER_VISIBLE_ROWS)
         lines = []
-        for index, profile in enumerate(self.profiles):
+        for index in range(self.visible_start, visible_end):
+            profile = self.profiles[index]
             cursor = ">" if index == self.selected_index else " "
             marker = " (current)" if profile == self.current_profile else ""
             lines.append(f"{cursor} {profile}{marker}")
         self.query_one("#profiles", Static).update("\n".join(lines))
 
+    def _keep_selection_visible(self) -> None:
+        if not self.profiles:
+            self.visible_start = 0
+            return
+        max_start = max(0, len(self.profiles) - PROFILE_PICKER_VISIBLE_ROWS)
+        if self.selected_index < self.visible_start:
+            self.visible_start = self.selected_index
+        elif self.selected_index >= self.visible_start + PROFILE_PICKER_VISIBLE_ROWS:
+            self.visible_start = self.selected_index - PROFILE_PICKER_VISIBLE_ROWS + 1
+        self.visible_start = max(0, min(self.visible_start, max_start))
 
 
 class ProcessingSubmitScreen(ModalScreen[str | None]):

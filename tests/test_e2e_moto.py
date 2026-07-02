@@ -400,6 +400,33 @@ def test_processing_tui_switches_profile_with_picker(monkeypatch, sagemaker_clie
     asyncio.run(run_app())
 
 
+def test_processing_tui_profile_picker_keeps_cursor_visible_at_end(monkeypatch, sagemaker_client, logs_client):
+    create_active_processing_job(sagemaker_client, "profile-processing")
+    ctx = context_with_steps(sagemaker_client, logs_client, "unused")
+    profiles = [f"mock-{index:02d}" for index in range(25)]
+    monkeypatch.setattr(tui_module, "available_profiles", lambda: profiles)
+    monkeypatch.setattr(tui_module, "build_contexts", lambda profile_names, *_args, **_kwargs: [ctx])
+
+    async def run_app() -> None:
+        app_under_test = ProcessingJobsApp(("mock-00",), REGION, False, 60)
+        async with app_under_test.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            for _ in range(30):
+                await pilot.press("down")
+            await pilot.pause()
+            profiles_view = app_under_test.screen.query_one("#profiles", Static)
+            rendered = str(profiles_view.content)
+            assert "> mock-24" in rendered
+            assert "mock-00 (current)" not in rendered
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app_under_test.profiles == ("mock-24",)
+
+    asyncio.run(run_app())
+
+
 def test_processing_tui_keeps_current_profile_when_selected_profile_fails(monkeypatch, sagemaker_client, logs_client):
     create_active_processing_job(sagemaker_client, "profile-processing")
     ctx = context_with_steps(sagemaker_client, logs_client, "unused")
