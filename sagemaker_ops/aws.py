@@ -523,6 +523,10 @@ def tail_step_logs(ctx: AwsContext, step: dict[str, Any], limit: int = 80) -> li
     return tail_cloudwatch_logs(ctx, log_group, stream_prefix, limit=limit)
 
 
+def tail_processing_job_logs(ctx: AwsContext, job_name: str, limit: int = 80) -> list[str]:
+    return tail_cloudwatch_logs(ctx, "/aws/sagemaker/ProcessingJobs", job_name, limit=limit)
+
+
 def tail_cloudwatch_logs(
     ctx: AwsContext,
     log_group: str,

@@ -4,7 +4,7 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 
-from textual.widgets import DataTable, Static
+from textual.widgets import DataTable, RichLog, Static
 from typer.testing import CliRunner
 
 import sagemaker_ops.cli as cli_module
@@ -17,6 +17,7 @@ from sagemaker_ops.aws import (
     list_pipeline_steps,
     list_processing_jobs,
     list_processing_jobs_page,
+    tail_processing_job_logs,
     tail_step_logs,
 )
 from sagemaker_ops.cli import app
@@ -146,6 +147,16 @@ def test_pipeline_start_list_steps_and_failed_logs_with_moto(
     seed_failed_step_logs(logs_client)
     failed_step = pipeline_steps(execution_arn)[1]
     assert any("boom: validation failed" in line for line in tail_step_logs(ctx, failed_step))
+
+
+def test_processing_job_logs_tail_from_cloudwatch(sagemaker_client, logs_client):
+    create_active_processing_job(sagemaker_client, "processing-with-logs")
+    seed_failed_step_logs(logs_client, "processing-with-logs")
+    ctx = context_with_steps(sagemaker_client, logs_client, "unused")
+
+    lines = tail_processing_job_logs(ctx, "processing-with-logs")
+
+    assert any("boom: validation failed" in line for line in lines)
 
 
 def test_pipeline_list_includes_recent_finished_execution(sagemaker_client):
@@ -548,6 +559,30 @@ def test_processing_tui_shows_running_jobs_and_keyboard_navigation(monkeypatch, 
             assert table.cursor_row == 1
 
             assert app_under_test.jobs[table.cursor_row].name.startswith("processing-")
+
+    asyncio.run(run_app())
+
+
+def test_processing_tui_loads_selected_job_logs(monkeypatch, sagemaker_client, logs_client):
+    create_active_processing_job(sagemaker_client, "processing-with-logs")
+    seed_failed_step_logs(logs_client, "processing-with-logs")
+    ctx = context_with_steps(sagemaker_client, logs_client, "unused")
+    monkeypatch.setattr(tui_module, "build_contexts", lambda *_args, **_kwargs: [ctx])
+
+    async def run_app() -> None:
+        app_under_test = ProcessingJobsApp(("mock-dev",), REGION, False, 60)
+        async with app_under_test.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            assert app_under_test.query_one("#detail", Static)
+            assert app_under_test.query_one("#processing-logs", RichLog)
+            table = app_under_test.query_one("#jobs", DataTable)
+            assert table.row_count == 1
+
+            app_under_test.load_selected_processing_logs()
+            await pilot.pause()
+
+            assert app_under_test.loaded_processing_log_key == ("mock-dev", REGION, "processing-with-logs")
+            assert any("boom: validation failed" in line for line in tail_processing_job_logs(ctx, "processing-with-logs"))
 
     asyncio.run(run_app())
 

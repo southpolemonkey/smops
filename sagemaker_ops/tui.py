@@ -30,6 +30,7 @@ from sagemaker_ops.aws import (
     parse_parameters,
     start_pipeline_execution,
     submit_processing_job,
+    tail_processing_job_logs,
     tail_step_logs,
 )
 
@@ -49,14 +50,26 @@ class BaseSageMakerApp(App[None]):
         border: solid $surface;
     }
 
-    #detail, #logs {
+    #detail, #logs, #processing-logs {
         height: 1fr;
         border: solid $surface;
         padding: 1;
     }
 
+    #jobs {
+        width: 52%;
+    }
+
+    #processing-side {
+        width: 48%;
+    }
+
     #detail {
-        width: 40%;
+        height: 45%;
+    }
+
+    #processing-logs {
+        height: 55%;
     }
 
     #pipeline-content {
@@ -210,6 +223,7 @@ class ProcessingJobsApp(BaseSageMakerApp):
         Binding("up", "previous_job", "Previous", priority=True),
         Binding("right", "next_job", "Next", priority=True),
         Binding("down", "next_job", "Next", priority=True),
+        Binding("l", "load_logs", "Logs", priority=True),
         Binding("s", "submit_processing", "Submit", priority=True),
     ]
 
@@ -222,6 +236,7 @@ class ProcessingJobsApp(BaseSageMakerApp):
     ) -> None:
         super().__init__(profiles, region, all_profiles, refresh_seconds)
         self.jobs: list[ProcessingJobView] = []
+        self.loaded_processing_log_key: tuple[str, str, str] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -230,7 +245,9 @@ class ProcessingJobsApp(BaseSageMakerApp):
             table = DataTable(id="jobs")
             table.cursor_type = "row"
             yield table
-            yield Static("", id="detail")
+            with Vertical(id="processing-side"):
+                yield Static("", id="detail")
+                yield RichLog(id="processing-logs", wrap=True, highlight=True, auto_scroll=False)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -245,7 +262,7 @@ class ProcessingJobsApp(BaseSageMakerApp):
             self.query_one("#status", Static).update(
                 f"{len(self.jobs)} running processing job(s). Refresh every {self.refresh_seconds}s. "
                 f"Profile: {self.profile_label()}. "
-                "Use arrows to move, P to choose profile, s to submit, r to refresh, q to quit."
+                "Use arrows to move, P to choose profile, l to load logs, s to submit, r to refresh, q to quit."
             )
         except AwsCliError as exc:
             self.show_error(exc)
@@ -265,6 +282,9 @@ class ProcessingJobsApp(BaseSageMakerApp):
         table = self.query_one("#jobs", DataTable)
         if table.row_count:
             table.move_cursor(row=min(table.row_count - 1, table.cursor_row + 1))
+
+    def action_load_logs(self) -> None:
+        self.load_selected_processing_logs()
 
     def action_submit_processing(self) -> None:
         self.push_screen(ProcessingSubmitScreen(), self.submit_processing_from_form)
@@ -313,8 +333,12 @@ class ProcessingJobsApp(BaseSageMakerApp):
 
     def update_processing_detail(self, index: int | None) -> None:
         detail = self.query_one("#detail", Static)
+        logs = self.query_one("#processing-logs", RichLog)
         if index is None or index >= len(self.jobs):
             detail.update("No running processing jobs.")
+            self.loaded_processing_log_key = None
+            logs.clear()
+            logs.write("Select a processing job to view logs.")
             return
         job = self.jobs[index]
         detail.update(
@@ -334,6 +358,46 @@ class ProcessingJobsApp(BaseSageMakerApp):
                 ]
             )
         )
+        if self.loaded_processing_log_key == self.selected_processing_log_key():
+            return
+        self.loaded_processing_log_key = None
+        logs.clear()
+        logs.write("Press l to load CloudWatch log tail.")
+
+    def selected_processing_job(self) -> ProcessingJobView | None:
+        table = self.query_one("#jobs", DataTable)
+        if not self.jobs or table.cursor_row >= len(self.jobs):
+            return None
+        return self.jobs[table.cursor_row]
+
+    def selected_processing_context(self) -> AwsContext | None:
+        job = self.selected_processing_job()
+        if job is None:
+            return None
+        for ctx in self.load_contexts():
+            if ctx.profile == job.profile and ctx.region == job.region:
+                return ctx
+        return None
+
+    def selected_processing_log_key(self) -> tuple[str, str, str] | None:
+        job = self.selected_processing_job()
+        if job is None:
+            return None
+        return job.profile, job.region, job.name
+
+    def load_selected_processing_logs(self) -> None:
+        logs = self.query_one("#processing-logs", RichLog)
+        logs.clear()
+        job = self.selected_processing_job()
+        ctx = self.selected_processing_context()
+        if job is None or ctx is None:
+            self.loaded_processing_log_key = None
+            logs.write("Select a processing job first.")
+            return
+        self.loaded_processing_log_key = self.selected_processing_log_key()
+        logs.write(f"CloudWatch /aws/sagemaker/ProcessingJobs prefix={job.name}")
+        for line in tail_processing_job_logs(ctx, job.name):
+            logs.write(line)
 
 
 class PipelineExecutionsApp(BaseSageMakerApp):
