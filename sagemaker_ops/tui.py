@@ -17,6 +17,9 @@ PROFILE_PICKER_VISIBLE_ROWS = 16
 from sagemaker_ops.aws import (
     AwsCliError,
     AwsContext,
+    EcsClusterView,
+    EcsServiceView,
+    EcsTaskView,
     available_profiles,
     ProcessingJobView,
     PipelineExecutionView,
@@ -25,12 +28,16 @@ from sagemaker_ops.aws import (
     format_duration,
     infer_log_source,
     list_active_pipeline_executions,
+    list_ecs_clusters,
+    list_ecs_services,
+    list_ecs_tasks,
     list_pipeline_steps,
     list_processing_jobs,
     load_job_spec,
     parse_parameters,
     start_pipeline_execution,
     submit_processing_job,
+    tail_ecs_task_logs,
     tail_processing_job_logs,
     tail_step_logs,
 )
@@ -73,8 +80,32 @@ class BaseSageMakerApp(App[None]):
         height: 55%;
     }
 
-    #pipeline-content {
+    #pipeline-content, #ecs-content {
         height: 1fr;
+    }
+
+    #ecs-top {
+        height: 42%;
+    }
+
+    #ecs-bottom {
+        height: 58%;
+    }
+
+    #ecs-clusters-pane {
+        width: 36%;
+    }
+
+    #ecs-services-pane {
+        width: 64%;
+    }
+
+    #ecs-tasks-pane {
+        width: 52%;
+    }
+
+    #ecs-logs-pane {
+        width: 48%;
     }
 
     #executions-pane {
@@ -704,6 +735,250 @@ class PipelineExecutionsApp(BaseSageMakerApp):
         return self.selected_execution_arn, step_name
 
 
+class EcsTasksApp(BaseSageMakerApp):
+    TITLE = "Amazon ECS Tasks"
+    BINDINGS = BaseSageMakerApp.BINDINGS + [
+        ("left", "focus_left", "Left"),
+        ("right", "focus_right", "Right"),
+        ("l", "load_logs", "Logs"),
+    ]
+
+    def __init__(
+        self,
+        profiles: tuple[str, ...],
+        region: str | None,
+        all_profiles: bool,
+        refresh_seconds: int,
+    ) -> None:
+        super().__init__(profiles, region, all_profiles, refresh_seconds)
+        self.clusters: list[tuple[AwsContext, EcsClusterView]] = []
+        self.services: list[EcsServiceView] = []
+        self.tasks: list[EcsTaskView] = []
+        self.selected_context: AwsContext | None = None
+        self.selected_cluster: EcsClusterView | None = None
+        self.loaded_ecs_log_key: tuple[str, str, str, str] | None = None
+        self._rendering_clusters = False
+        self._rendering_services = False
+        self._rendering_tasks = False
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("Loading...", id="status")
+        with Vertical(id="ecs-content"):
+            with Horizontal(id="ecs-top"):
+                with Vertical(id="ecs-clusters-pane"):
+                    clusters = DataTable(id="ecs-clusters")
+                    clusters.cursor_type = "row"
+                    yield clusters
+                with Vertical(id="ecs-services-pane"):
+                    services = DataTable(id="ecs-services")
+                    services.cursor_type = "row"
+                    yield services
+            with Horizontal(id="ecs-bottom"):
+                with Vertical(id="ecs-tasks-pane"):
+                    tasks = DataTable(id="ecs-tasks")
+                    tasks.cursor_type = "row"
+                    yield tasks
+                with Vertical(id="ecs-logs-pane"):
+                    yield RichLog(id="ecs-logs", wrap=True, highlight=True, auto_scroll=False)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#ecs-clusters", DataTable).add_columns("Profile", "Region", "Cluster", "Running", "Services")
+        self.query_one("#ecs-services", DataTable).add_columns("Service", "Status", "Desired", "Running", "Pending")
+        self.query_one("#ecs-tasks", DataTable).add_columns("Task", "Last", "Desired", "Launch", "Started", "Containers")
+        super().on_mount()
+
+    def action_refresh(self) -> None:
+        try:
+            self.clusters = [(ctx, cluster) for ctx in self.load_contexts() for cluster in list_ecs_clusters(ctx)]
+            self.render_clusters()
+            self.query_one("#status", Static).update(
+                f"{len(self.clusters)} ECS cluster(s). Refresh every {self.refresh_seconds}s. "
+                f"Profile: {self.profile_label()}. Use left/right to switch panes, arrows to move, l to load logs."
+            )
+        except AwsCliError as exc:
+            self.show_error(exc)
+
+    def action_focus_left(self) -> None:
+        focused = self.focused
+        if focused and focused.id == "ecs-services":
+            self.query_one("#ecs-clusters", DataTable).focus()
+        elif focused and focused.id == "ecs-tasks":
+            self.query_one("#ecs-services", DataTable).focus()
+        else:
+            self.query_one("#ecs-tasks", DataTable).focus()
+
+    def action_focus_right(self) -> None:
+        focused = self.focused
+        if focused and focused.id == "ecs-clusters":
+            self.query_one("#ecs-services", DataTable).focus()
+        elif focused and focused.id == "ecs-services":
+            self.query_one("#ecs-tasks", DataTable).focus()
+        else:
+            self.query_one("#ecs-clusters", DataTable).focus()
+
+    def action_load_logs(self) -> None:
+        self.load_selected_ecs_logs()
+
+    def render_clusters(self) -> None:
+        table = self.query_one("#ecs-clusters", DataTable)
+        self._rendering_clusters = True
+        try:
+            table.clear()
+            for index, (_, cluster) in enumerate(self.clusters):
+                table.add_row(
+                    cluster.profile,
+                    cluster.region,
+                    cluster.cluster_name or cluster.cluster_arn,
+                    str(cluster.running_tasks),
+                    str(cluster.active_services),
+                    key=str(index),
+                )
+            if table.row_count:
+                table.move_cursor(row=0, scroll=False)
+        finally:
+            self._rendering_clusters = False
+        self.update_services(0 if self.clusters else None)
+
+    @on(DataTable.RowHighlighted, "#ecs-clusters")
+    def on_ecs_cluster_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if self._rendering_clusters:
+            return
+        try:
+            self.update_services(int(str(event.row_key.value)))
+        except (TypeError, ValueError):
+            pass
+
+    def update_services(self, index: int | None) -> None:
+        self.services = []
+        self.tasks = []
+        self.selected_context = None
+        self.selected_cluster = None
+        logs = self.query_one("#ecs-logs", RichLog)
+        logs.clear()
+        if index is None or index >= len(self.clusters):
+            self.query_one("#ecs-services", DataTable).clear()
+            self.query_one("#ecs-tasks", DataTable).clear()
+            logs.write("No ECS clusters found.")
+            return
+        ctx, cluster = self.clusters[index]
+        self.selected_context = ctx
+        self.selected_cluster = cluster
+        try:
+            self.services = list_ecs_services(ctx, cluster.cluster_name or cluster.cluster_arn)
+        except AwsCliError as exc:
+            logs.write(str(exc))
+            return
+        table = self.query_one("#ecs-services", DataTable)
+        self._rendering_services = True
+        try:
+            table.clear()
+            for service_index, service in enumerate(self.services):
+                table.add_row(
+                    service.service_name or service.service_arn,
+                    service.status,
+                    str(service.desired_count),
+                    str(service.running_count),
+                    str(service.pending_count),
+                    key=str(service_index),
+                )
+            if table.row_count:
+                table.move_cursor(row=0, scroll=False)
+        finally:
+            self._rendering_services = False
+        self.update_tasks(0 if self.services else None)
+
+    @on(DataTable.RowHighlighted, "#ecs-services")
+    def on_ecs_service_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if self._rendering_services:
+            return
+        try:
+            self.update_tasks(int(str(event.row_key.value)))
+        except (TypeError, ValueError):
+            pass
+
+    def update_tasks(self, service_index: int | None) -> None:
+        self.tasks = []
+        logs = self.query_one("#ecs-logs", RichLog)
+        logs.clear()
+        cluster = self.selected_cluster
+        ctx = self.selected_context
+        if cluster is None or ctx is None:
+            self.query_one("#ecs-tasks", DataTable).clear()
+            logs.write("Select an ECS cluster first.")
+            return
+        service_name = None
+        if service_index is not None and service_index < len(self.services):
+            service_name = self.services[service_index].service_name
+        try:
+            self.tasks = list_ecs_tasks(ctx, cluster.cluster_name or cluster.cluster_arn, service=service_name, desired_status="RUNNING")
+        except AwsCliError as exc:
+            logs.write(str(exc))
+            return
+        table = self.query_one("#ecs-tasks", DataTable)
+        self._rendering_tasks = True
+        try:
+            table.clear()
+            for task_index, task in enumerate(self.tasks):
+                table.add_row(
+                    task.task_id,
+                    task.last_status,
+                    task.desired_status,
+                    task.launch_type,
+                    format_dt(task.started_at),
+                    ", ".join(container.get("name", "") for container in task.containers),
+                    key=str(task_index),
+                )
+            if table.row_count:
+                table.move_cursor(row=0, scroll=False)
+        finally:
+            self._rendering_tasks = False
+        self.loaded_ecs_log_key = None
+        logs.write("Press l to load CloudWatch logs for the selected running task.")
+
+    @on(DataTable.RowHighlighted, "#ecs-tasks")
+    def on_ecs_task_highlighted(self, _: DataTable.RowHighlighted) -> None:
+        if self._rendering_tasks:
+            return
+        if self.loaded_ecs_log_key == self.selected_ecs_log_key():
+            return
+        self.loaded_ecs_log_key = None
+        logs = self.query_one("#ecs-logs", RichLog)
+        logs.clear()
+        logs.write("Press l to load CloudWatch logs for the selected running task.")
+
+    def selected_ecs_task(self) -> EcsTaskView | None:
+        table = self.query_one("#ecs-tasks", DataTable)
+        if not self.tasks or table.cursor_row >= len(self.tasks):
+            return None
+        return self.tasks[table.cursor_row]
+
+    def selected_ecs_log_key(self) -> tuple[str, str, str, str] | None:
+        ctx = self.selected_context
+        cluster = self.selected_cluster
+        task = self.selected_ecs_task()
+        if ctx is None or cluster is None or task is None:
+            return None
+        return ctx.profile, ctx.region, cluster.cluster_name or cluster.cluster_arn, task.task_arn
+
+    def load_selected_ecs_logs(self) -> None:
+        logs = self.query_one("#ecs-logs", RichLog)
+        logs.clear()
+        ctx = self.selected_context
+        cluster = self.selected_cluster
+        task = self.selected_ecs_task()
+        if ctx is None or cluster is None or task is None:
+            self.loaded_ecs_log_key = None
+            logs.write("Select an ECS task first.")
+            return
+        cluster_name = cluster.cluster_name or cluster.cluster_arn
+        self.loaded_ecs_log_key = self.selected_ecs_log_key()
+        logs.write(f"CloudWatch logs for task {task.task_id}")
+        for line in tail_ecs_task_logs(ctx, cluster_name, task.task_arn):
+            logs.write(line)
+
+
 class SmopsTuiApp(App[str | None]):
     TITLE = "smops"
     CSS = BaseSageMakerApp.CSS
@@ -724,6 +999,7 @@ class SmopsTuiApp(App[str | None]):
         table.add_columns("View", "Description")
         table.add_row("pipelines", "Pipeline executions, steps, failed logs, start pipeline", key="pipelines")
         table.add_row("processing", "Processing jobs, details, submit processing job", key="processing")
+        table.add_row("ecs", "ECS clusters, services, running tasks, CloudWatch logs", key="ecs")
         table.focus()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:

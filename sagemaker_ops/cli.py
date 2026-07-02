@@ -36,7 +36,7 @@ from sagemaker_ops.aws import (
     wait_pipeline_execution,
     wait_processing_job,
 )
-from sagemaker_ops.tui import ProcessingJobsApp, PipelineExecutionsApp, SmopsTuiApp
+from sagemaker_ops.tui import EcsTasksApp, ProcessingJobsApp, PipelineExecutionsApp, SmopsTuiApp
 
 
 console = Console()
@@ -732,6 +732,8 @@ def tui_main(
         ProcessingJobsApp(tuple(profile or ()), _effective_region(region), all_profiles, refresh).run()
     elif selected == "pipelines":
         PipelineExecutionsApp(tuple(profile or ()), _effective_region(region), all_profiles, refresh, None, hours).run()
+    elif selected == "ecs":
+        EcsTasksApp(tuple(profile or ()), _effective_region(region), all_profiles, refresh).run()
 
 
 @tui_app.command("processing")
@@ -743,6 +745,17 @@ def tui_processing(
 ) -> None:
     """Interactively inspect running Processing Jobs."""
     ProcessingJobsApp(tuple(profile or ()), _effective_region(region), all_profiles, refresh).run()
+
+
+@tui_app.command("ecs")
+def tui_ecs(
+    profile: Annotated[list[str] | None, typer.Option("--profile", "-p", help="AWS profile. Can be passed multiple times.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    all_profiles: Annotated[bool, typer.Option("--all-profiles", help="Inspect all local AWS profiles.")] = False,
+    refresh: Annotated[int, typer.Option("--refresh", min=5, max=300, help="Refresh interval in seconds.")] = 15,
+) -> None:
+    """Interactively inspect ECS clusters, services, running tasks, and logs."""
+    EcsTasksApp(tuple(profile or ()), _effective_region(region), all_profiles, refresh).run()
 
 
 @tui_app.command("pipelines")

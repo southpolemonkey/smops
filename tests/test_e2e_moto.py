@@ -17,6 +17,7 @@ from sagemaker_ops.aws import (
     AwsCliError,
     AwsContext,
     EcsClusterView,
+    EcsServiceView,
     EcsTaskView,
     build_contexts,
     list_active_pipeline_executions,
@@ -33,7 +34,7 @@ from sagemaker_ops.aws import (
     tail_step_logs,
 )
 from sagemaker_ops.cli import app
-from sagemaker_ops.tui import PipelineExecutionsApp, ProcessingJobsApp, SmopsTuiApp
+from sagemaker_ops.tui import EcsTasksApp, PipelineExecutionsApp, ProcessingJobsApp, SmopsTuiApp
 
 from .conftest import (
     ACCOUNT_ID,
@@ -665,7 +666,7 @@ def test_smops_tui_home_selects_processing_view():
         async with app_under_test.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             table = app_under_test.query_one("#home", DataTable)
-            assert table.row_count == 2
+            assert table.row_count == 3
             await pilot.press("down")
             await pilot.press("enter")
             assert app_under_test.return_value == "processing"
@@ -750,6 +751,66 @@ def test_processing_tui_keeps_current_profile_when_selected_profile_fails(monkey
             assert app_under_test.profiles == ("mock-dev",)
             status = app_under_test.query_one("#status", Static).content
             assert "ForbiddenException" in str(status)
+
+    asyncio.run(run_app())
+
+
+def test_smops_tui_home_selects_ecs_view():
+    async def run_app() -> None:
+        app_under_test = SmopsTuiApp()
+        async with app_under_test.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            table = app_under_test.query_one("#home", DataTable)
+            assert table.row_count == 3
+            await pilot.press("down")
+            await pilot.press("down")
+            await pilot.press("enter")
+            assert app_under_test.return_value == "ecs"
+
+    asyncio.run(run_app())
+
+
+def test_ecs_tui_shows_clusters_services_tasks_and_loads_logs(monkeypatch):
+    ctx = AwsContext("mock-dev", REGION, None, None, None)
+    cluster = EcsClusterView("mock-dev", REGION, "arn:cluster/demo", "demo", "ACTIVE", 1, 0, 1)
+    service = EcsServiceView("mock-dev", REGION, "demo", "arn:service/api", "api", "ACTIVE", 1, 1, 0, "td:1")
+    task = EcsTaskView(
+        profile="mock-dev",
+        region=REGION,
+        cluster="demo",
+        task_arn="arn:task/demo/abc123",
+        task_id="abc123",
+        task_definition_arn="td:1",
+        last_status="RUNNING",
+        desired_status="RUNNING",
+        launch_type="FARGATE",
+        started_at=datetime(2026, 7, 2, 1, 2, tzinfo=timezone.utc),
+        stopped_at=None,
+        stopped_reason="",
+        containers=[{"name": "api", "last_status": "RUNNING"}],
+    )
+    monkeypatch.setattr(tui_module, "build_contexts", lambda *_args, **_kwargs: [ctx])
+    monkeypatch.setattr(tui_module, "list_ecs_clusters", lambda _ctx: [cluster])
+    monkeypatch.setattr(tui_module, "list_ecs_services", lambda _ctx, _cluster: [service])
+    monkeypatch.setattr(tui_module, "list_ecs_tasks", lambda _ctx, _cluster, service=None, desired_status="RUNNING": [task])
+    monkeypatch.setattr(tui_module, "tail_ecs_task_logs", lambda *_args, **_kwargs: ["api ready"])
+
+    async def run_app() -> None:
+        app_under_test = EcsTasksApp(("mock-dev",), REGION, False, 60)
+        async with app_under_test.run_test(size=(160, 50)) as pilot:
+            await pilot.pause()
+            clusters = app_under_test.query_one("#ecs-clusters", DataTable)
+            services = app_under_test.query_one("#ecs-services", DataTable)
+            tasks = app_under_test.query_one("#ecs-tasks", DataTable)
+            assert clusters.row_count == 1
+            assert services.row_count == 1
+            assert tasks.row_count == 1
+
+            app_under_test.load_selected_ecs_logs()
+            await pilot.pause()
+
+            assert app_under_test.loaded_ecs_log_key == ("mock-dev", REGION, "demo", "arn:task/demo/abc123")
+            assert app_under_test.selected_ecs_task().task_id == "abc123"
 
     asyncio.run(run_app())
 

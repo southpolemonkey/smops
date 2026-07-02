@@ -143,6 +143,25 @@ smops ecs logs --profile dev --region us-east-1 --cluster my-cluster --task arn:
 
 ECS log discovery supports containers using the `awslogs` log driver. If a task has multiple awslogs containers, pass `--container`.
 
+## ECS TUI
+
+```bash
+smops tui ecs --profile dev --region us-east-1
+```
+
+The ECS TUI shows clusters, services, running tasks, and CloudWatch logs.
+
+Keyboard shortcuts:
+
+- `Left` / `Right`: switch focus between clusters, services, and tasks
+- `Up` / `Down`: move within the focused table
+- `l`: load CloudWatch logs for the selected running task
+- `p` / `P`: choose an AWS profile
+- `r`: refresh
+- `q`: quit
+
+Log discovery uses the selected task's task definition and supports containers using the `awslogs` log driver.
+
 ## Interactive TUI
 
 Open the TUI selector and choose between Pipelines and Processing Jobs:
