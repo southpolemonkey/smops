@@ -30,6 +30,7 @@ class AwsContext:
     region: str
     sagemaker: Any
     logs: Any
+    ecs: Any = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,249 @@ class PipelineExecutionView:
 class PipelineExecutionsPage:
     executions: list[PipelineExecutionView]
     next_token: str | None
+
+
+@dataclass(frozen=True)
+class EcsClusterView:
+    profile: str
+    region: str
+    cluster_arn: str
+    cluster_name: str
+    status: str
+    running_tasks: int
+    pending_tasks: int
+    active_services: int
+
+
+@dataclass(frozen=True)
+class EcsServiceView:
+    profile: str
+    region: str
+    cluster: str
+    service_arn: str
+    service_name: str
+    status: str
+    desired_count: int
+    running_count: int
+    pending_count: int
+    task_definition: str
+
+
+@dataclass(frozen=True)
+class EcsTaskView:
+    profile: str
+    region: str
+    cluster: str
+    task_arn: str
+    task_id: str
+    task_definition_arn: str
+    last_status: str
+    desired_status: str
+    launch_type: str
+    started_at: datetime | None
+    stopped_at: datetime | None
+    stopped_reason: str
+    containers: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class EcsLogSource:
+    container_name: str
+    log_group: str
+    stream_prefix: str
+    log_stream: str
+
+
+def list_ecs_clusters(ctx: AwsContext) -> list[EcsClusterView]:
+    arns = _paginate_arns(ctx.ecs, "list_clusters", "clusterArns")
+    if not arns:
+        return []
+    clusters: list[EcsClusterView] = []
+    for chunk in _chunks(arns, 100):
+        try:
+            response = ctx.ecs.describe_clusters(clusters=chunk)
+        except (BotoCoreError, ClientError) as exc:
+            raise AwsCliError(f"读取 ECS clusters 失败: {exc}") from exc
+        for cluster in response.get("clusters", []):
+            clusters.append(
+                EcsClusterView(
+                    profile=ctx.profile,
+                    region=ctx.region,
+                    cluster_arn=cluster.get("clusterArn", ""),
+                    cluster_name=cluster.get("clusterName", ""),
+                    status=cluster.get("status", ""),
+                    running_tasks=cluster.get("runningTasksCount", 0),
+                    pending_tasks=cluster.get("pendingTasksCount", 0),
+                    active_services=cluster.get("activeServicesCount", 0),
+                )
+            )
+    return sorted(clusters, key=lambda item: item.cluster_name)
+
+
+def list_ecs_services(ctx: AwsContext, cluster: str) -> list[EcsServiceView]:
+    arns = _paginate_arns(ctx.ecs, "list_services", "serviceArns", cluster=cluster)
+    if not arns:
+        return []
+    services: list[EcsServiceView] = []
+    for chunk in _chunks(arns, 10):
+        try:
+            response = ctx.ecs.describe_services(cluster=cluster, services=chunk)
+        except (BotoCoreError, ClientError) as exc:
+            raise AwsCliError(f"读取 ECS services 失败 cluster={cluster}: {exc}") from exc
+        for service in response.get("services", []):
+            services.append(
+                EcsServiceView(
+                    profile=ctx.profile,
+                    region=ctx.region,
+                    cluster=cluster,
+                    service_arn=service.get("serviceArn", ""),
+                    service_name=service.get("serviceName", ""),
+                    status=service.get("status", ""),
+                    desired_count=service.get("desiredCount", 0),
+                    running_count=service.get("runningCount", 0),
+                    pending_count=service.get("pendingCount", 0),
+                    task_definition=service.get("taskDefinition", ""),
+                )
+            )
+    return sorted(services, key=lambda item: item.service_name)
+
+
+def list_ecs_tasks(
+    ctx: AwsContext,
+    cluster: str,
+    service: str | None = None,
+    desired_status: str = "RUNNING",
+) -> list[EcsTaskView]:
+    request = {"cluster": cluster, "desiredStatus": desired_status.upper()}
+    if service:
+        request["serviceName"] = service
+    arns = _paginate_arns(ctx.ecs, "list_tasks", "taskArns", **request)
+    if not arns:
+        return []
+    return describe_ecs_tasks(ctx, cluster, arns)
+
+
+def describe_ecs_task(ctx: AwsContext, cluster: str, task: str) -> EcsTaskView:
+    tasks = describe_ecs_tasks(ctx, cluster, [task])
+    if not tasks:
+        raise AwsCliError(f"没有找到 ECS task: {task}")
+    return tasks[0]
+
+
+def describe_ecs_tasks(ctx: AwsContext, cluster: str, tasks: list[str]) -> list[EcsTaskView]:
+    views: list[EcsTaskView] = []
+    for chunk in _chunks(tasks, 100):
+        try:
+            response = ctx.ecs.describe_tasks(cluster=cluster, tasks=chunk)
+        except (BotoCoreError, ClientError) as exc:
+            raise AwsCliError(f"读取 ECS tasks 失败 cluster={cluster}: {exc}") from exc
+        failures = response.get("failures", [])
+        if failures and not response.get("tasks"):
+            reason = failures[0].get("reason", "unknown")
+            arn = failures[0].get("arn", "")
+            raise AwsCliError(f"读取 ECS task 失败 task={arn or chunk[0]}: {reason}")
+        for task in response.get("tasks", []):
+            views.append(_ecs_task_view_from_detail(ctx, cluster, task))
+    return sorted(views, key=lambda item: item.started_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
+
+def tail_ecs_task_logs(
+    ctx: AwsContext,
+    cluster: str,
+    task: str,
+    container: str | None = None,
+    limit: int = 80,
+) -> list[str]:
+    task_view = describe_ecs_task(ctx, cluster, task)
+    source = resolve_ecs_task_log_source(ctx, task_view, container)
+    return tail_cloudwatch_logs(ctx, source.log_group, source.log_stream, limit=limit)
+
+
+def resolve_ecs_task_log_source(ctx: AwsContext, task: EcsTaskView, container: str | None = None) -> EcsLogSource:
+    try:
+        response = ctx.ecs.describe_task_definition(taskDefinition=task.task_definition_arn)
+    except (BotoCoreError, ClientError) as exc:
+        raise AwsCliError(f"读取 ECS task definition 失败: {exc}") from exc
+    definitions = response.get("taskDefinition", {}).get("containerDefinitions", [])
+    awslogs = [definition for definition in definitions if _is_awslogs_container(definition)]
+    if container:
+        awslogs = [definition for definition in awslogs if definition.get("name") == container]
+        if not awslogs:
+            raise AwsCliError(f"container {container} 没有配置 awslogs log driver")
+    elif len(awslogs) > 1:
+        names = ", ".join(definition.get("name", "") for definition in awslogs)
+        raise AwsCliError(f"Task 有多个 awslogs containers，请传 --container。可选: {names}")
+    elif not awslogs:
+        raise AwsCliError("Task definition 没有配置 awslogs log driver")
+
+    definition = awslogs[0]
+    options = definition.get("logConfiguration", {}).get("options", {})
+    log_group = options.get("awslogs-group")
+    stream_prefix = options.get("awslogs-stream-prefix")
+    container_name = definition.get("name", "")
+    if not log_group or not stream_prefix or not container_name:
+        raise AwsCliError("awslogs 配置缺少 awslogs-group、awslogs-stream-prefix 或 container name")
+    task_id = task.task_id
+    log_stream = f"{stream_prefix}/{container_name}/{task_id}"
+    return EcsLogSource(
+        container_name=container_name,
+        log_group=log_group,
+        stream_prefix=stream_prefix,
+        log_stream=log_stream,
+    )
+
+
+def _ecs_task_view_from_detail(ctx: AwsContext, cluster: str, task: dict[str, Any]) -> EcsTaskView:
+    task_arn = task.get("taskArn", "")
+    return EcsTaskView(
+        profile=ctx.profile,
+        region=ctx.region,
+        cluster=cluster,
+        task_arn=task_arn,
+        task_id=_ecs_task_id(task_arn),
+        task_definition_arn=task.get("taskDefinitionArn", ""),
+        last_status=task.get("lastStatus", ""),
+        desired_status=task.get("desiredStatus", ""),
+        launch_type=task.get("launchType", ""),
+        started_at=task.get("startedAt"),
+        stopped_at=task.get("stoppedAt"),
+        stopped_reason=task.get("stoppedReason", ""),
+        containers=[
+            {
+                "name": container.get("name", ""),
+                "last_status": container.get("lastStatus", ""),
+                "exit_code": container.get("exitCode"),
+                "reason": container.get("reason", ""),
+                "runtime_id": container.get("runtimeId", ""),
+            }
+            for container in task.get("containers", [])
+        ],
+    )
+
+
+def _paginate_arns(client: Any, operation_name: str, result_key: str, **kwargs: Any) -> list[str]:
+    try:
+        paginator = client.get_paginator(operation_name)
+        items: list[str] = []
+        for page in paginator.paginate(**kwargs):
+            items.extend(page.get(result_key, []))
+        return items
+    except (BotoCoreError, ClientError) as exc:
+        raise AwsCliError(f"读取 ECS {operation_name} 失败: {exc}") from exc
+
+
+def _is_awslogs_container(definition: dict[str, Any]) -> bool:
+    log_config = definition.get("logConfiguration") or {}
+    return log_config.get("logDriver") == "awslogs"
+
+
+def _ecs_task_id(task_arn: str) -> str:
+    return task_arn.rsplit("/", 1)[-1] if task_arn else ""
+
+
+def _chunks(items: list[Any], size: int) -> Iterable[list[Any]]:
+    for index in range(0, len(items), size):
+        yield items[index : index + size]
 
 
 def load_job_spec(path: Path) -> dict[str, Any]:
@@ -140,6 +384,7 @@ def build_contexts(
                     region=resolved_region,
                     sagemaker=session.client("sagemaker"),
                     logs=session.client("logs"),
+                    ecs=session.client("ecs"),
                 )
             )
         except (BotoCoreError, ClientError) as exc:

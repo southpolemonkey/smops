@@ -1,24 +1,34 @@
 from __future__ import annotations
 
 import asyncio
+import boto3
 import json
 import time
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 
 from textual.widgets import DataTable, RichLog, Static
+from botocore.stub import Stubber
 from typer.testing import CliRunner
 
 import sagemaker_ops.cli as cli_module
 import sagemaker_ops.tui as tui_module
 from sagemaker_ops.aws import (
     AwsCliError,
+    AwsContext,
+    EcsClusterView,
+    EcsTaskView,
     build_contexts,
     list_active_pipeline_executions,
+    list_ecs_clusters,
+    list_ecs_services,
+    list_ecs_tasks,
     list_pipeline_executions_page,
     list_pipeline_steps,
     list_processing_jobs,
     list_processing_jobs_page,
+    resolve_ecs_task_log_source,
+    tail_ecs_task_logs,
     tail_processing_job_logs,
     tail_step_logs,
 )
@@ -72,6 +82,213 @@ class SlowPipelineListClient:
         finally:
             with self.lock:
                 self.active_calls -= 1
+
+
+def stubbed_ecs_context():
+    ecs = boto3.client("ecs", region_name=REGION)
+    logs = boto3.client("logs", region_name=REGION)
+    return AwsContext("mock-dev", REGION, None, logs, ecs), Stubber(ecs), Stubber(logs)
+
+
+def test_ecs_helpers_list_clusters_services_tasks_and_logs():
+    ctx, ecs_stubber, logs_stubber = stubbed_ecs_context()
+    cluster_arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:cluster/demo"
+    service_arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:service/demo/api"
+    task_arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task/demo/abc123"
+    task_definition_arn = f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task-definition/demo:1"
+
+    ecs_stubber.add_response("list_clusters", {"clusterArns": [cluster_arn]}, {})
+    ecs_stubber.add_response(
+        "describe_clusters",
+        {
+            "clusters": [
+                {
+                    "clusterArn": cluster_arn,
+                    "clusterName": "demo",
+                    "status": "ACTIVE",
+                    "runningTasksCount": 1,
+                    "pendingTasksCount": 0,
+                    "activeServicesCount": 1,
+                }
+            ]
+        },
+        {"clusters": [cluster_arn]},
+    )
+    ecs_stubber.add_response("list_services", {"serviceArns": [service_arn]}, {"cluster": "demo"})
+    ecs_stubber.add_response(
+        "describe_services",
+        {
+            "services": [
+                {
+                    "serviceArn": service_arn,
+                    "serviceName": "api",
+                    "status": "ACTIVE",
+                    "desiredCount": 1,
+                    "runningCount": 1,
+                    "pendingCount": 0,
+                    "taskDefinition": task_definition_arn,
+                }
+            ]
+        },
+        {"cluster": "demo", "services": [service_arn]},
+    )
+    ecs_stubber.add_response(
+        "list_tasks",
+        {"taskArns": [task_arn]},
+        {"cluster": "demo", "desiredStatus": "RUNNING", "serviceName": "api"},
+    )
+    ecs_stubber.add_response(
+        "describe_tasks",
+        {
+            "tasks": [
+                {
+                    "taskArn": task_arn,
+                    "clusterArn": cluster_arn,
+                    "taskDefinitionArn": task_definition_arn,
+                    "lastStatus": "RUNNING",
+                    "desiredStatus": "RUNNING",
+                    "launchType": "FARGATE",
+                    "startedAt": datetime(2026, 7, 2, 1, 2, tzinfo=timezone.utc),
+                    "containers": [{"name": "api", "lastStatus": "RUNNING", "runtimeId": "runtime-1"}],
+                }
+            ]
+        },
+        {"cluster": "demo", "tasks": [task_arn]},
+    )
+    ecs_stubber.add_response(
+        "describe_tasks",
+        {
+            "tasks": [
+                {
+                    "taskArn": task_arn,
+                    "clusterArn": cluster_arn,
+                    "taskDefinitionArn": task_definition_arn,
+                    "lastStatus": "RUNNING",
+                    "desiredStatus": "RUNNING",
+                    "launchType": "FARGATE",
+                    "startedAt": datetime(2026, 7, 2, 1, 2, tzinfo=timezone.utc),
+                    "containers": [{"name": "api", "lastStatus": "RUNNING", "runtimeId": "runtime-1"}],
+                }
+            ]
+        },
+        {"cluster": "demo", "tasks": [task_arn]},
+    )
+    ecs_stubber.add_response(
+        "describe_task_definition",
+        {
+            "taskDefinition": {
+                "taskDefinitionArn": task_definition_arn,
+                "family": "demo",
+                "containerDefinitions": [
+                    {
+                        "name": "api",
+                        "image": "example.com/api:latest",
+                        "logConfiguration": {
+                            "logDriver": "awslogs",
+                            "options": {
+                                "awslogs-group": "/ecs/demo",
+                                "awslogs-region": REGION,
+                                "awslogs-stream-prefix": "ecs",
+                            },
+                        },
+                    }
+                ],
+            }
+        },
+        {"taskDefinition": task_definition_arn},
+    )
+    logs_stubber.add_response(
+        "describe_log_streams",
+        {"logStreams": [{"logStreamName": "ecs/api/abc123", "lastEventTimestamp": 2000}]},
+        {"logGroupName": "/ecs/demo", "logStreamNamePrefix": "ecs/api/abc123", "limit": 5},
+    )
+    logs_stubber.add_response(
+        "get_log_events",
+        {"events": [{"timestamp": 2000, "message": "api ready"}]},
+        {"logGroupName": "/ecs/demo", "logStreamName": "ecs/api/abc123", "limit": 80, "startFromHead": False},
+    )
+
+    with ecs_stubber, logs_stubber:
+        clusters = list_ecs_clusters(ctx)
+        services = list_ecs_services(ctx, "demo")
+        tasks = list_ecs_tasks(ctx, "demo", service="api")
+        lines = tail_ecs_task_logs(ctx, "demo", task_arn)
+
+    assert clusters[0].cluster_name == "demo"
+    assert services[0].service_name == "api"
+    assert tasks[0].task_id == "abc123"
+    assert any("api ready" in line for line in lines)
+
+
+def test_ecs_log_source_requires_container_when_multiple_awslogs_containers():
+    ctx = AwsContext("mock-dev", REGION, None, None, None)
+    task = EcsTaskView(
+        profile="mock-dev",
+        region=REGION,
+        cluster="demo",
+        task_arn=f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task/demo/abc123",
+        task_id="abc123",
+        task_definition_arn="demo:1",
+        last_status="RUNNING",
+        desired_status="RUNNING",
+        launch_type="FARGATE",
+        started_at=None,
+        stopped_at=None,
+        stopped_reason="",
+        containers=[],
+    )
+
+    class FakeEcs:
+        def describe_task_definition(self, taskDefinition):
+            return {
+                "taskDefinition": {
+                    "containerDefinitions": [
+                        {
+                            "name": "api",
+                            "logConfiguration": {
+                                "logDriver": "awslogs",
+                                "options": {"awslogs-group": "/ecs/demo", "awslogs-stream-prefix": "ecs"},
+                            },
+                        },
+                        {
+                            "name": "worker",
+                            "logConfiguration": {
+                                "logDriver": "awslogs",
+                                "options": {"awslogs-group": "/ecs/demo", "awslogs-stream-prefix": "ecs"},
+                            },
+                        },
+                    ]
+                }
+            }
+
+    ctx = AwsContext(ctx.profile, ctx.region, ctx.sagemaker, ctx.logs, FakeEcs())
+
+    try:
+        resolve_ecs_task_log_source(ctx, task)
+    except AwsCliError as exc:
+        assert "--container" in str(exc)
+    else:
+        raise AssertionError("expected AwsCliError")
+
+
+def test_ecs_cli_clusters_json(monkeypatch):
+    ctx = AwsContext("mock-dev", REGION, None, None, None)
+    monkeypatch.setattr(cli_module, "build_contexts", lambda *_args, **_kwargs: [ctx])
+    monkeypatch.setattr(
+        cli_module,
+        "list_ecs_clusters",
+        lambda _ctx: [
+            EcsClusterView("mock-dev", REGION, "arn:cluster/demo", "demo", "ACTIVE", 2, 0, 1)
+        ],
+    )
+
+    result = runner.invoke(app, ["ecs", "clusters", "--region", REGION, "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ok"
+    assert payload["count"] == 1
+    assert payload["items"][0]["cluster_name"] == "demo"
 
 
 def test_processing_submit_and_running_list_cli_with_moto(processing_spec, sagemaker_client):

@@ -15,12 +15,16 @@ from sagemaker_ops.config import config_path, get_default_region, load_config, r
 from sagemaker_ops.aws import (
     AwsCliError,
     build_contexts,
+    describe_ecs_task,
     describe_pipeline_execution,
     describe_processing_job,
     diagnose_pipeline_execution,
     format_dt,
     format_duration,
     inspect_pipeline_execution,
+    list_ecs_clusters,
+    list_ecs_services,
+    list_ecs_tasks,
     list_pipeline_executions_page,
     list_pipeline_steps,
     list_processing_jobs_page,
@@ -28,6 +32,7 @@ from sagemaker_ops.aws import (
     parse_parameters,
     start_pipeline_execution,
     submit_processing_job,
+    tail_ecs_task_logs,
     wait_pipeline_execution,
     wait_processing_job,
 )
@@ -38,10 +43,12 @@ console = Console()
 app = typer.Typer(help="SageMaker Processing Job and Pipeline operations CLI.", no_args_is_help=True)
 processing_app = typer.Typer(help="Submit and inspect SageMaker Processing Jobs.", no_args_is_help=True)
 pipeline_app = typer.Typer(help="Start and inspect SageMaker Pipelines.", no_args_is_help=True)
+ecs_app = typer.Typer(help="Inspect Amazon ECS clusters, services, tasks, and logs.", no_args_is_help=True)
 tui_app = typer.Typer(help="Interactive TUI views.", invoke_without_command=True, no_args_is_help=False)
 config_app = typer.Typer(help="Manage smops defaults.", no_args_is_help=True)
 app.add_typer(processing_app, name="processing")
 app.add_typer(pipeline_app, name="pipeline")
+app.add_typer(ecs_app, name="ecs")
 app.add_typer(tui_app, name="tui")
 app.add_typer(config_app, name="config")
 
@@ -536,6 +543,175 @@ def pipeline_diagnose(
     if diagnosis.get("log_group"):
         console.print(f"Logs: {diagnosis['log_group']} / {diagnosis['log_stream_prefix']}")
     for line in diagnosis["log_tail"]:
+        console.print(line)
+
+
+@ecs_app.command("clusters")
+def ecs_clusters(
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """List ECS clusters."""
+    try:
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
+        clusters = list_ecs_clusters(ctx)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({"status": "ok", "profile": ctx.profile, "region": ctx.region, "items": clusters, "count": len(clusters)})
+        return
+
+    if not clusters:
+        console.print("[yellow]No ECS clusters found.[/yellow]")
+        return
+    table = Table("Profile", "Region", "Cluster", "Status", "Running", "Pending", "Services")
+    for cluster in clusters:
+        table.add_row(
+            cluster.profile,
+            cluster.region,
+            cluster.cluster_name or cluster.cluster_arn,
+            cluster.status,
+            str(cluster.running_tasks),
+            str(cluster.pending_tasks),
+            str(cluster.active_services),
+        )
+    console.print(table)
+
+
+@ecs_app.command("services")
+def ecs_services(
+    cluster: Annotated[str, typer.Option("--cluster", "-c", help="ECS cluster name or ARN.")],
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """List ECS services in a cluster."""
+    try:
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
+        services = list_ecs_services(ctx, cluster)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({"status": "ok", "profile": ctx.profile, "region": ctx.region, "cluster": cluster, "items": services, "count": len(services)})
+        return
+
+    if not services:
+        console.print(f"[yellow]No ECS services found in cluster {cluster}.[/yellow]")
+        return
+    table = Table("Profile", "Region", "Service", "Status", "Desired", "Running", "Pending", "Task Definition")
+    for service in services:
+        table.add_row(
+            service.profile,
+            service.region,
+            service.service_name or service.service_arn,
+            service.status,
+            str(service.desired_count),
+            str(service.running_count),
+            str(service.pending_count),
+            service.task_definition.rsplit("/", 1)[-1],
+        )
+    console.print(table)
+
+
+@ecs_app.command("tasks")
+def ecs_tasks(
+    cluster: Annotated[str, typer.Option("--cluster", "-c", help="ECS cluster name or ARN.")],
+    service: Annotated[str | None, typer.Option("--service", "-s", help="Filter tasks by ECS service name.")] = None,
+    status: Annotated[str, typer.Option("--status", help="Desired task status: RUNNING, STOPPED, or PENDING.")] = "RUNNING",
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """List ECS tasks in a cluster."""
+    try:
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
+        tasks = list_ecs_tasks(ctx, cluster, service=service, desired_status=status)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({"status": "ok", "profile": ctx.profile, "region": ctx.region, "cluster": cluster, "items": tasks, "count": len(tasks)})
+        return
+
+    if not tasks:
+        console.print(f"[yellow]No ECS {status.upper()} tasks found in cluster {cluster}.[/yellow]")
+        return
+    table = Table("Profile", "Region", "Task", "Last", "Desired", "Launch", "Started", "Containers")
+    for task in tasks:
+        table.add_row(
+            task.profile,
+            task.region,
+            task.task_id,
+            task.last_status,
+            task.desired_status,
+            task.launch_type,
+            format_dt(task.started_at),
+            ", ".join(container.get("name", "") for container in task.containers),
+        )
+    console.print(table)
+
+
+@ecs_app.command("task")
+def ecs_task(
+    cluster: Annotated[str, typer.Option("--cluster", "-c", help="ECS cluster name or ARN.")],
+    task: Annotated[str, typer.Option("--task", "-t", help="ECS task ID or ARN.")],
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """Describe one ECS task."""
+    try:
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
+        task_view = describe_ecs_task(ctx, cluster, task)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({"status": "ok", "profile": ctx.profile, "region": ctx.region, "cluster": cluster, "task": task_view})
+        return
+
+    console.print(f"[bold]{task_view.task_id}[/bold] {task_view.last_status} desired={task_view.desired_status}")
+    console.print(f"Cluster: {task_view.cluster}")
+    console.print(f"Task definition: {task_view.task_definition_arn}")
+    if task_view.stopped_reason:
+        console.print(f"Stopped reason: {task_view.stopped_reason}")
+    table = Table("Container", "Last Status", "Exit", "Reason", "Runtime ID")
+    for container in task_view.containers:
+        table.add_row(
+            container.get("name", ""),
+            container.get("last_status", ""),
+            "" if container.get("exit_code") is None else str(container.get("exit_code")),
+            container.get("reason", ""),
+            container.get("runtime_id", ""),
+        )
+    console.print(table)
+
+
+@ecs_app.command("logs")
+def ecs_logs(
+    cluster: Annotated[str, typer.Option("--cluster", "-c", help="ECS cluster name or ARN.")],
+    task: Annotated[str, typer.Option("--task", "-t", help="ECS task ID or ARN.")],
+    container: Annotated[str | None, typer.Option("--container", help="Container name when the task has multiple awslogs containers.")] = None,
+    limit: Annotated[int, typer.Option("--limit", min=1, max=500, help="Max CloudWatch log lines to return.")] = 80,
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """Tail CloudWatch logs for one ECS task container using awslogs config."""
+    try:
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
+        lines = tail_ecs_task_logs(ctx, cluster, task, container=container, limit=limit)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({"status": "ok", "profile": ctx.profile, "region": ctx.region, "cluster": cluster, "task": task, "lines": lines, "count": len(lines)})
+        return
+
+    for line in lines:
         console.print(line)
 
 

@@ -129,6 +129,20 @@ smops pipeline start \
   --parameter Mode=prod
 ```
 
+## ECS Task Inspection
+
+`smops` can also inspect ECS clusters, services, tasks, and awslogs-backed task logs:
+
+```bash
+smops ecs clusters --profile dev --region us-east-1
+smops ecs services --profile dev --region us-east-1 --cluster my-cluster
+smops ecs tasks --profile dev --region us-east-1 --cluster my-cluster --service my-service
+smops ecs task --profile dev --region us-east-1 --cluster my-cluster --task arn:aws:ecs:...
+smops ecs logs --profile dev --region us-east-1 --cluster my-cluster --task arn:aws:ecs:... --container app
+```
+
+ECS log discovery supports containers using the `awslogs` log driver. If a task has multiple awslogs containers, pass `--container`.
+
 ## Interactive TUI
 
 Open the TUI selector and choose between Pipelines and Processing Jobs:
