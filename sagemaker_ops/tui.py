@@ -760,6 +760,10 @@ class EcsTasksApp(BaseSageMakerApp):
         self._rendering_clusters = False
         self._rendering_services = False
         self._rendering_tasks = False
+        # Saved before each background refresh to restore cursor position after.
+        self._refresh_previous_cluster_name: str | None = None
+        self._refresh_previous_service_name: str | None = None
+        self._refresh_previous_focused_id: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -790,15 +794,47 @@ class EcsTasksApp(BaseSageMakerApp):
         super().on_mount()
 
     def action_refresh(self) -> None:
-        try:
-            self.clusters = [(ctx, cluster) for ctx in self.load_contexts() for cluster in list_ecs_clusters(ctx)]
-            self.render_clusters()
-            self.query_one("#status", Static).update(
-                f"{len(self.clusters)} ECS cluster(s). Refresh every {self.refresh_seconds}s. "
-                f"Profile: {self.profile_label()}. Use left/right to switch panes, arrows to move, l to load logs."
-            )
-        except AwsCliError as exc:
-            self.show_error(exc)
+        # Save current selection and focus so we can restore after the worker completes.
+        self._refresh_previous_cluster_name = self.selected_cluster.cluster_name if self.selected_cluster else None
+        self._refresh_previous_service_name = (
+            self.services[self.query_one("#ecs-services", DataTable).cursor_row].service_name
+            if self.services and self.query_one("#ecs-services", DataTable).row_count
+            else None
+        )
+        self._refresh_previous_focused_id = self.focused.id if self.focused else None
+        self.query_one("#status", Static).update(
+            f"Loading ECS clusters... Profile: {self.profile_label()}."
+        )
+        self.run_worker(
+            self._load_clusters,
+            name="ecs-refresh",
+            group="ecs-refresh",
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def _load_clusters(self) -> list[tuple[AwsContext, EcsClusterView]]:
+        return [(ctx, cluster) for ctx in self.load_contexts() for cluster in list_ecs_clusters(ctx)]
+
+    @on(Worker.StateChanged)
+    def on_ecs_refresh_worker_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker.name != "ecs-refresh" or event.state not in {WorkerState.SUCCESS, WorkerState.ERROR}:
+            return
+        if event.state == WorkerState.ERROR:
+            exc = event.worker.error
+            self.show_error(exc if isinstance(exc, Exception) else AwsCliError(str(exc)))
+            return
+        self.clusters = event.worker.result
+        self.render_clusters(
+            preferred_cluster_name=self._refresh_previous_cluster_name,
+            preferred_service_name=self._refresh_previous_service_name,
+            preferred_focused_id=self._refresh_previous_focused_id,
+        )
+        self.query_one("#status", Static).update(
+            f"{len(self.clusters)} ECS cluster(s). Refresh every {self.refresh_seconds}s. "
+            f"Profile: {self.profile_label()}. Use left/right to switch panes, arrows to move, l to load logs."
+        )
 
     def action_focus_left(self) -> None:
         focused = self.focused
@@ -821,12 +857,20 @@ class EcsTasksApp(BaseSageMakerApp):
     def action_load_logs(self) -> None:
         self.load_selected_ecs_logs()
 
-    def render_clusters(self) -> None:
+    def render_clusters(
+        self,
+        preferred_cluster_name: str | None = None,
+        preferred_service_name: str | None = None,
+        preferred_focused_id: str | None = None,
+    ) -> None:
         table = self.query_one("#ecs-clusters", DataTable)
+        selected_index = 0 if self.clusters else None
         self._rendering_clusters = True
         try:
             table.clear()
             for index, (_, cluster) in enumerate(self.clusters):
+                if preferred_cluster_name and cluster.cluster_name == preferred_cluster_name:
+                    selected_index = index
                 table.add_row(
                     cluster.profile,
                     cluster.region,
@@ -835,11 +879,17 @@ class EcsTasksApp(BaseSageMakerApp):
                     str(cluster.active_services),
                     key=str(index),
                 )
-            if table.row_count:
-                table.move_cursor(row=0, scroll=False)
+            if selected_index is not None and table.row_count:
+                table.move_cursor(row=selected_index, scroll=False)
         finally:
             self._rendering_clusters = False
-        self.update_services(0 if self.clusters else None)
+        self.update_services(selected_index, preferred_service_name=preferred_service_name)
+        # Restore focus to whichever pane the user was in before the refresh.
+        if preferred_focused_id:
+            try:
+                self.query_one(f"#{preferred_focused_id}").focus()
+            except Exception:
+                pass
 
     @on(DataTable.RowHighlighted, "#ecs-clusters")
     def on_ecs_cluster_highlighted(self, event: DataTable.RowHighlighted) -> None:
@@ -850,7 +900,7 @@ class EcsTasksApp(BaseSageMakerApp):
         except (TypeError, ValueError):
             pass
 
-    def update_services(self, index: int | None) -> None:
+    def update_services(self, index: int | None, preferred_service_name: str | None = None) -> None:
         self.services = []
         self.tasks = []
         self.selected_context = None
@@ -871,10 +921,13 @@ class EcsTasksApp(BaseSageMakerApp):
             logs.write(str(exc))
             return
         table = self.query_one("#ecs-services", DataTable)
+        selected_service_index = 0 if self.services else None
         self._rendering_services = True
         try:
             table.clear()
             for service_index, service in enumerate(self.services):
+                if preferred_service_name and service.service_name == preferred_service_name:
+                    selected_service_index = service_index
                 table.add_row(
                     service.service_name or service.service_arn,
                     service.status,
@@ -883,11 +936,11 @@ class EcsTasksApp(BaseSageMakerApp):
                     str(service.pending_count),
                     key=str(service_index),
                 )
-            if table.row_count:
-                table.move_cursor(row=0, scroll=False)
+            if selected_service_index is not None and table.row_count:
+                table.move_cursor(row=selected_service_index, scroll=False)
         finally:
             self._rendering_services = False
-        self.update_tasks(0 if self.services else None)
+        self.update_tasks(selected_service_index)
 
     @on(DataTable.RowHighlighted, "#ecs-services")
     def on_ecs_service_highlighted(self, event: DataTable.RowHighlighted) -> None:

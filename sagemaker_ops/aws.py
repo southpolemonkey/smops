@@ -147,17 +147,26 @@ def list_ecs_task_history(
     past runs. Each stream's firstEventTimestamp / lastEventTimestamp proxy the
     task start and end times.
     """
-    # AWS does not allow orderBy=LastEventTime with a logStreamNamePrefix, so
-    # we fetch by prefix (LogStreamName order) and sort by lastEventTimestamp
-    # client-side, fetching enough pages to cover the requested limit.
+    # AWS does not allow orderBy=LastEventTime with a logStreamNamePrefix.
+    # Without a prefix: use LastEventTime order and stop early (most-recent first).
+    # With a prefix: must use LogStreamName order — exhaust all matching pages then
+    # sort client-side (task IDs are random UUIDs that sort in arbitrary order).
     try:
         paginator = ctx.logs.get_paginator("describe_log_streams")
-        kwargs: dict[str, Any] = {"logGroupName": log_group, "orderBy": "LogStreamName", "descending": True}
-        if stream_prefix:
-            kwargs["logStreamNamePrefix"] = stream_prefix
         streams: list[dict[str, Any]] = []
-        for page in paginator.paginate(**kwargs, PaginationConfig={"MaxItems": limit * 4}):
-            streams.extend(page.get("logStreams", []))
+        if stream_prefix:
+            kwargs: dict[str, Any] = {
+                "logGroupName": log_group,
+                "logStreamNamePrefix": stream_prefix,
+                "orderBy": "LogStreamName",
+                "descending": True,
+            }
+            for page in paginator.paginate(**kwargs):
+                streams.extend(page.get("logStreams", []))
+        else:
+            kwargs = {"logGroupName": log_group, "orderBy": "LastEventTime", "descending": True}
+            for page in paginator.paginate(**kwargs, PaginationConfig={"MaxItems": limit}):
+                streams.extend(page.get("logStreams", []))
     except ctx.logs.exceptions.ResourceNotFoundException:
         raise AwsCliError(f"日志组不存在: {log_group}")
     except (BotoCoreError, ClientError) as exc:
