@@ -125,6 +125,66 @@ class EcsLogSource:
     log_stream: str
 
 
+@dataclass(frozen=True)
+class EcsTaskHistoryEntry:
+    task_id: str
+    log_stream: str
+    started_at: datetime
+    ended_at: datetime
+    duration_seconds: float
+
+
+def list_ecs_task_history(
+    ctx: AwsContext,
+    log_group: str,
+    stream_prefix: str,
+    limit: int = 20,
+) -> list[EcsTaskHistoryEntry]:
+    """Return historical ECS task runs by inspecting CloudWatch log streams.
+
+    The ECS API only retains stopped tasks for ~1 hour; log streams persist
+    for the lifetime of the log group, making this the reliable way to enumerate
+    past runs. Each stream's firstEventTimestamp / lastEventTimestamp proxy the
+    task start and end times.
+    """
+    # AWS does not allow orderBy=LastEventTime with a logStreamNamePrefix, so
+    # we fetch by prefix (LogStreamName order) and sort by lastEventTimestamp
+    # client-side, fetching enough pages to cover the requested limit.
+    try:
+        paginator = ctx.logs.get_paginator("describe_log_streams")
+        kwargs: dict[str, Any] = {"logGroupName": log_group, "orderBy": "LogStreamName", "descending": True}
+        if stream_prefix:
+            kwargs["logStreamNamePrefix"] = stream_prefix
+        streams: list[dict[str, Any]] = []
+        for page in paginator.paginate(**kwargs, PaginationConfig={"MaxItems": limit * 4}):
+            streams.extend(page.get("logStreams", []))
+    except ctx.logs.exceptions.ResourceNotFoundException:
+        raise AwsCliError(f"日志组不存在: {log_group}")
+    except (BotoCoreError, ClientError) as exc:
+        raise AwsCliError(f"读取日志流历史失败: {exc}") from exc
+
+    streams.sort(key=lambda s: s.get("lastEventTimestamp", 0), reverse=True)
+
+    entries: list[EcsTaskHistoryEntry] = []
+    for stream in streams[:limit]:
+        first_ms = stream.get("firstEventTimestamp")
+        last_ms = stream.get("lastEventTimestamp")
+        if not first_ms or not last_ms:
+            continue
+        stream_name = stream["logStreamName"]
+        task_id = stream_name.rsplit("/", 1)[-1]
+        started = datetime.fromtimestamp(first_ms / 1000, tz=timezone.utc)
+        ended = datetime.fromtimestamp(last_ms / 1000, tz=timezone.utc)
+        entries.append(EcsTaskHistoryEntry(
+            task_id=task_id,
+            log_stream=stream_name,
+            started_at=started,
+            ended_at=ended,
+            duration_seconds=(last_ms - first_ms) / 1000,
+        ))
+    return entries
+
+
 def list_ecs_clusters(ctx: AwsContext) -> list[EcsClusterView]:
     arns = _paginate_arns(ctx.ecs, "list_clusters", "clusterArns")
     if not arns:

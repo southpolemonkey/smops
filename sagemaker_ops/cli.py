@@ -16,6 +16,8 @@ from sagemaker_ops.aws import (
     AwsCliError,
     build_contexts,
     describe_ecs_task,
+    EcsTaskHistoryEntry,
+    list_ecs_task_history,
     describe_pipeline_execution,
     describe_processing_job,
     diagnose_pipeline_execution,
@@ -713,6 +715,68 @@ def ecs_logs(
 
     for line in lines:
         console.print(line)
+
+
+@ecs_app.command("history")
+def ecs_history(
+    log_group: Annotated[str, typer.Option("--log-group", "-g", help="CloudWatch log group name.")],
+    stream_prefix: Annotated[str | None, typer.Option("--stream-prefix", "-s", help="Log stream name prefix to filter (e.g. the awslogs-stream-prefix).")] = None,
+    limit: Annotated[int, typer.Option("--limit", min=1, max=200, help="Max number of historical runs to return.")] = 20,
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """List historical ECS task runs via CloudWatch log streams.
+
+    The ECS API only retains stopped tasks for ~1 hour. This command looks up
+    CloudWatch log streams for the given log group instead, giving you a full
+    run history going back as far as the log group retention allows.
+    """
+    try:
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
+        entries = list_ecs_task_history(ctx, log_group, stream_prefix or "", limit=limit)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({
+            "status": "ok",
+            "profile": ctx.profile,
+            "region": ctx.region,
+            "log_group": log_group,
+            "items": [
+                {
+                    "task_id": e.task_id,
+                    "log_stream": e.log_stream,
+                    "started_at": e.started_at.isoformat(),
+                    "ended_at": e.ended_at.isoformat(),
+                    "duration_seconds": e.duration_seconds,
+                }
+                for e in entries
+            ],
+            "count": len(entries),
+        })
+        return
+
+    if not entries:
+        console.print(f"[yellow]No log streams found in {log_group}.[/yellow]")
+        return
+
+    def _fmt_dur(secs: float) -> str:
+        h, rem = divmod(int(secs), 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
+
+    table = Table("#", "Started (UTC)", "Ended (UTC)", "Duration", "Task ID")
+    for i, entry in enumerate(entries, 1):
+        table.add_row(
+            str(i),
+            entry.started_at.strftime("%Y-%m-%d %H:%M"),
+            entry.ended_at.strftime("%Y-%m-%d %H:%M"),
+            _fmt_dur(entry.duration_seconds),
+            entry.task_id,
+        )
+    console.print(table)
 
 
 @tui_app.callback(invoke_without_command=True)
