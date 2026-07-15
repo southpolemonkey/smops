@@ -15,6 +15,10 @@ PROFILE_PICKER_VISIBLE_ROWS = 16
 
 
 from sagemaker_ops.aws import (
+    AirflowDagView,
+    AirflowDagRunView,
+    AirflowPoolView,
+    AirflowTaskInstanceView,
     AwsCliError,
     AwsContext,
     EcsClusterView,
@@ -28,6 +32,10 @@ from sagemaker_ops.aws import (
     format_duration,
     infer_log_source,
     list_active_pipeline_executions,
+    list_airflow_dag_runs,
+    list_airflow_dags,
+    list_airflow_pools,
+    list_airflow_task_instances,
     list_ecs_clusters,
     list_ecs_services,
     list_ecs_tasks,
@@ -40,6 +48,7 @@ from sagemaker_ops.aws import (
     tail_ecs_task_logs,
     tail_processing_job_logs,
     tail_step_logs,
+    trigger_airflow_dag,
 )
 
 
@@ -122,6 +131,26 @@ class BaseSageMakerApp(App[None]):
 
     #logs-pane {
         width: 52%;
+    }
+
+    #airflow-content {
+        height: 1fr;
+    }
+
+    #airflow-top {
+        height: 42%;
+    }
+
+    #airflow-bottom {
+        height: 58%;
+    }
+
+    #airflow-runs-pane {
+        width: 50%;
+    }
+
+    #airflow-detail-pane {
+        width: 50%;
     }
 
     .dialog {
@@ -1032,6 +1061,356 @@ class EcsTasksApp(BaseSageMakerApp):
             logs.write(line)
 
 
+class AirflowApp(BaseSageMakerApp):
+    TITLE = "Amazon MWAA / Airflow"
+    BINDINGS = BaseSageMakerApp.BINDINGS + [
+        ("left", "focus_left", "Left"),
+        ("right", "focus_right", "Right"),
+        ("l", "load_tasks", "Tasks"),
+        Binding("t", "trigger_dag", "Trigger", priority=True),
+    ]
+
+    def __init__(
+        self,
+        profiles: tuple[str, ...],
+        region: str | None,
+        all_profiles: bool,
+        refresh_seconds: int,
+        environment: str | None,
+    ) -> None:
+        super().__init__(profiles, region, all_profiles, refresh_seconds)
+        self.environment = environment
+        self.dags: list[AirflowDagView] = []
+        self.pools: list[AirflowPoolView] = []
+        self.runs: list[AirflowDagRunView] = []
+        self.selected_context: AwsContext | None = None
+        self._rendering_dags = False
+        self._rendering_runs = False
+        # Keys identify which async result is current, so stale worker results are ignored.
+        self._requested_runs_dag: str | None = None
+        self._requested_tasks_key: tuple[str, str] | None = None
+        self._refresh_previous_dag_id: str | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("Loading...", id="status")
+        with Vertical(id="airflow-content"):
+            with Vertical(id="airflow-top"):
+                dags = DataTable(id="airflow-dags")
+                dags.cursor_type = "row"
+                yield dags
+            with Horizontal(id="airflow-bottom"):
+                with Vertical(id="airflow-runs-pane"):
+                    runs = DataTable(id="airflow-runs")
+                    runs.cursor_type = "row"
+                    yield runs
+                with Vertical(id="airflow-detail-pane"):
+                    yield RichLog(id="airflow-detail", wrap=True, highlight=True, auto_scroll=False)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#airflow-dags", DataTable).add_columns("Profile", "Environment", "DAG", "Paused", "Schedule")
+        self.query_one("#airflow-runs", DataTable).add_columns("Run", "State", "Type", "Runtime", "Started")
+        self.query_one("#airflow-detail", RichLog).write("Loading MWAA DAGs...")
+        super().on_mount()
+
+    def action_refresh(self) -> None:
+        if not self.environment:
+            self.show_error(
+                AwsCliError("No MWAA environment set. Launch with --env or run 'smops config set-mwaa-env <name>'.")
+            )
+            return
+        self._refresh_previous_dag_id = self.selected_dag().dag_id if self.selected_dag() else None
+        self.query_one("#status", Static).update(
+            f"Loading MWAA {self.environment}... Profile: {self.profile_label()}."
+        )
+        self.run_worker(
+            self._load_dags_and_pools,
+            name="airflow-refresh",
+            group="airflow-refresh",
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def _load_dags_and_pools(self) -> tuple[AwsContext | None, list[AirflowDagView], list[AirflowPoolView]]:
+        ctx = self.primary_context()
+        if ctx is None or not self.environment:
+            return None, [], []
+        dags = list_airflow_dags(ctx, self.environment)
+        pools = list_airflow_pools(ctx, self.environment)
+        return ctx, dags, pools
+
+    def _load_runs(self) -> tuple[str, list[AirflowDagRunView]]:
+        dag = self.selected_dag()
+        ctx = self.selected_context
+        if dag is None or ctx is None or not self.environment:
+            return "", []
+        return dag.dag_id, list_airflow_dag_runs(ctx, self.environment, dag.dag_id)
+
+    def _load_tasks(self) -> tuple[tuple[str, str] | None, list[AirflowTaskInstanceView]]:
+        dag = self.selected_dag()
+        run = self.selected_run()
+        ctx = self.selected_context
+        if dag is None or run is None or ctx is None or not self.environment:
+            return None, []
+        key = (dag.dag_id, run.dag_run_id)
+        return key, list_airflow_task_instances(ctx, self.environment, dag.dag_id, run.dag_run_id)
+
+    @on(Worker.StateChanged)
+    def on_airflow_worker_changed(self, event: Worker.StateChanged) -> None:
+        name = event.worker.name
+        if name not in {"airflow-refresh", "airflow-runs", "airflow-tasks"}:
+            return
+        if event.state == WorkerState.ERROR:
+            exc = event.worker.error
+            self.show_error(exc if isinstance(exc, Exception) else AwsCliError(str(exc)))
+            return
+        if event.state != WorkerState.SUCCESS:
+            return
+        if name == "airflow-refresh":
+            ctx, dags, pools = event.worker.result
+            self.selected_context = ctx
+            self.dags = dags
+            self.pools = pools
+            self.render_dags(self._refresh_previous_dag_id)
+            self.render_pools()
+            self.query_one("#status", Static).update(
+                f"{len(self.dags)} DAG(s) in {self.environment}. Refresh every {self.refresh_seconds}s. "
+                f"Profile: {self.profile_label()}. Use arrows to move, l to load tasks, t to trigger."
+            )
+        elif name == "airflow-runs":
+            dag_id, runs = event.worker.result
+            if dag_id != self._requested_runs_dag:
+                return
+            self.runs = runs
+            self.render_runs()
+        elif name == "airflow-tasks":
+            key, instances = event.worker.result
+            if key != self._requested_tasks_key:
+                return
+            self.render_tasks(instances)
+
+    def action_focus_left(self) -> None:
+        focused = self.focused
+        if focused and focused.id == "airflow-runs":
+            self.query_one("#airflow-dags", DataTable).focus()
+        else:
+            self.query_one("#airflow-runs", DataTable).focus()
+
+    def action_focus_right(self) -> None:
+        focused = self.focused
+        if focused and focused.id == "airflow-dags":
+            self.query_one("#airflow-runs", DataTable).focus()
+        else:
+            self.query_one("#airflow-dags", DataTable).focus()
+
+    def render_dags(self, preferred_dag_id: str | None = None) -> None:
+        table = self.query_one("#airflow-dags", DataTable)
+        selected_index = 0 if self.dags else None
+        self._rendering_dags = True
+        try:
+            table.clear()
+            for index, dag in enumerate(self.dags):
+                if preferred_dag_id and dag.dag_id == preferred_dag_id:
+                    selected_index = index
+                table.add_row(
+                    dag.profile,
+                    dag.environment,
+                    dag.dag_id,
+                    "yes" if dag.is_paused else "no",
+                    dag.schedule_interval,
+                    key=str(index),
+                )
+            if selected_index is not None and table.row_count:
+                table.move_cursor(row=selected_index, scroll=False)
+        finally:
+            self._rendering_dags = False
+        self.update_runs(selected_index)
+
+    @on(DataTable.RowHighlighted, "#airflow-dags")
+    def on_dag_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if self._rendering_dags:
+            return
+        try:
+            self.update_runs(int(str(event.row_key.value)))
+        except (TypeError, ValueError):
+            pass
+
+    def update_runs(self, index: int | None) -> None:
+        self.runs = []
+        runs_table = self.query_one("#airflow-runs", DataTable)
+        self._rendering_runs = True
+        try:
+            runs_table.clear()
+        finally:
+            self._rendering_runs = False
+        if index is None or index >= len(self.dags) or self.selected_context is None:
+            self._requested_runs_dag = None
+            return
+        dag = self.dags[index]
+        self._requested_runs_dag = dag.dag_id
+        self.query_one("#airflow-detail", RichLog).clear()
+        self.query_one("#airflow-detail", RichLog).write(f"Loading runs for {dag.dag_id}...")
+        self.run_worker(
+            self._load_runs,
+            name="airflow-runs",
+            group="airflow-runs",
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def render_runs(self) -> None:
+        table = self.query_one("#airflow-runs", DataTable)
+        self._rendering_runs = True
+        try:
+            table.clear()
+            for index, run in enumerate(self.runs):
+                table.add_row(
+                    run.dag_run_id,
+                    run.state,
+                    run.run_type,
+                    format_duration(run.start_date, run.end_date),
+                    format_dt(run.start_date),
+                    key=str(index),
+                )
+            if table.row_count:
+                table.move_cursor(row=0, scroll=False)
+        finally:
+            self._rendering_runs = False
+        self.render_pools()
+
+    def render_pools(self) -> None:
+        detail = self.query_one("#airflow-detail", RichLog)
+        detail.clear()
+        detail.write("[bold]Pools[/bold]")
+        if not self.pools:
+            detail.write("No pools.")
+        for pool in self.pools:
+            detail.write(
+                f"{pool.name}: {pool.occupied_slots}/{pool.slots} occupied, "
+                f"running={pool.running_slots}, queued={pool.queued_slots}, open={pool.open_slots}"
+            )
+        detail.write("")
+        detail.write("Select a run and press l to load task states.")
+
+    def render_tasks(self, instances: list[AirflowTaskInstanceView]) -> None:
+        detail = self.query_one("#airflow-detail", RichLog)
+        detail.clear()
+        run = self.selected_run()
+        detail.write(f"[bold]Task instances[/bold] {run.dag_run_id if run else ''}")
+        if not instances:
+            detail.write("No task instances.")
+            return
+        for instance in instances:
+            state = instance.state or "-"
+            detail.write(
+                f"{instance.task_id}: {state} "
+                f"(try {instance.try_number}, {format_duration(instance.start_date, instance.end_date)})"
+            )
+
+    def action_load_tasks(self) -> None:
+        dag = self.selected_dag()
+        run = self.selected_run()
+        if dag is None or run is None or self.selected_context is None:
+            detail = self.query_one("#airflow-detail", RichLog)
+            detail.clear()
+            detail.write("Select a DAG and a run first.")
+            return
+        self._requested_tasks_key = (dag.dag_id, run.dag_run_id)
+        detail = self.query_one("#airflow-detail", RichLog)
+        detail.clear()
+        detail.write(f"Loading task instances for {run.dag_run_id}...")
+        self.run_worker(
+            self._load_tasks,
+            name="airflow-tasks",
+            group="airflow-tasks",
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def action_trigger_dag(self) -> None:
+        dag = self.selected_dag()
+        if dag is None:
+            self.show_error(AwsCliError("Select a DAG to trigger."))
+            return
+        self.push_screen(AirflowTriggerScreen(dag.dag_id), self.trigger_dag_from_form)
+
+    def trigger_dag_from_form(self, values: dict[str, str] | None) -> None:
+        if not values:
+            return
+        try:
+            ctx = self.selected_context or self.primary_context()
+            if ctx is None or not self.environment:
+                raise AwsCliError("No AWS context or MWAA environment available.")
+            dag_id = values.get("dag_id", "").strip()
+            if not dag_id:
+                raise AwsCliError("DAG id is required.")
+            conf_text = values.get("conf", "").strip()
+            conf = None
+            if conf_text:
+                import json as _json
+
+                try:
+                    conf = _json.loads(conf_text)
+                except ValueError as exc:
+                    raise AwsCliError(f"conf must be valid JSON: {exc}") from exc
+                if not isinstance(conf, dict):
+                    raise AwsCliError("conf must be a JSON object")
+            run = trigger_airflow_dag(ctx, self.environment, dag_id, conf=conf)
+            self.query_one("#status", Static).update(
+                f"Triggered {dag_id}: {run.dag_run_id} ({run.state}) on {ctx.profile}/{ctx.region}."
+            )
+            self.action_refresh()
+        except Exception as exc:
+            self.show_error(exc)
+
+    def selected_dag(self) -> AirflowDagView | None:
+        table = self.query_one("#airflow-dags", DataTable)
+        if not self.dags or table.cursor_row >= len(self.dags):
+            return None
+        return self.dags[table.cursor_row]
+
+    def selected_run(self) -> AirflowDagRunView | None:
+        table = self.query_one("#airflow-runs", DataTable)
+        if not self.runs or table.cursor_row >= len(self.runs):
+            return None
+        return self.runs[table.cursor_row]
+
+
+class AirflowTriggerScreen(ModalScreen[dict[str, str] | None]):
+    def __init__(self, dag_id: str = "") -> None:
+        super().__init__()
+        self.dag_id = dag_id
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label("Trigger Airflow DAG")
+            yield Input(value=self.dag_id, placeholder="DAG id", id="dag-id")
+            yield Input(placeholder="Conf JSON (optional), e.g. {\"run_date\": \"2026-01-01\"}", id="conf")
+            with Horizontal():
+                yield Button("Trigger", id="trigger", variant="primary")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#dag-id", Input).focus()
+
+    @on(Button.Pressed, "#trigger")
+    def trigger(self) -> None:
+        self.dismiss(
+            {
+                "dag_id": self.query_one("#dag-id", Input).value,
+                "conf": self.query_one("#conf", Input).value,
+            }
+        )
+
+    @on(Button.Pressed, "#cancel")
+    def cancel(self) -> None:
+        self.dismiss(None)
+
+
 class SmopsTuiApp(App[str | None]):
     TITLE = "smops"
     CSS = BaseSageMakerApp.CSS
@@ -1053,6 +1432,7 @@ class SmopsTuiApp(App[str | None]):
         table.add_row("pipelines", "Pipeline executions, steps, failed logs, start pipeline", key="pipelines")
         table.add_row("processing", "Processing jobs, details, submit processing job", key="processing")
         table.add_row("ecs", "ECS clusters, services, running tasks, CloudWatch logs", key="ecs")
+        table.add_row("airflow", "MWAA DAGs, recent runs, task states, pools, trigger", key="airflow")
         table.focus()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:

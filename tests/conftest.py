@@ -219,3 +219,14 @@ def context_with_steps(
         sagemaker=SageMakerWithPipelineSteps(sagemaker_client, {execution_arn: pipeline_steps(execution_arn)}),
         logs=logs_client,
     )
+
+
+def stubbed_mwaa_context() -> Any:
+    """AwsContext with a real boto3 mwaa client wrapped in a Stubber.
+
+    moto has no MWAA backend, so MWAA API calls are stubbed like the ECS tests.
+    """
+    from botocore.stub import Stubber
+
+    mwaa = boto3.client("mwaa", region_name=REGION)
+    return AwsContext("mock-dev", REGION, None, None, None, mwaa), Stubber(mwaa)

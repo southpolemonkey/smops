@@ -9,6 +9,7 @@ It can:
 - Show running Processing Jobs in an interactive TUI
 - Show running and recently completed Pipeline executions in an interactive TUI
 - Inspect Pipeline step status and failed step CloudWatch logs
+- Monitor Amazon MWAA (Apache Airflow) DAG status, runs, task states, and pools, and trigger DAGs
 - Work with one, many, or all configured AWS profiles
 
 ## Installation
@@ -162,6 +163,57 @@ Keyboard shortcuts:
 
 Log discovery uses the selected task's task definition and supports containers using the `awslogs` log driver.
 
+## Airflow (Amazon MWAA)
+
+`smops` can monitor and trigger DAGs in an Amazon MWAA environment. It reads the
+Airflow REST API on the environment's private web server: it obtains a short-lived
+web login token via `mwaa:CreateWebLoginToken`, exchanges it for a session cookie,
+then calls the `/api/v1/...` endpoints. Your credentials therefore need
+`airflow:CreateWebLoginToken` (or the equivalent MWAA permission) and network access
+to the web server host.
+
+```bash
+smops airflow environments --profile dev --region ap-southeast-2
+smops airflow dags --profile dev --env my-environment --pattern avm
+smops airflow runs --profile dev --env my-environment --dag my_dag
+smops airflow tasks --profile dev --env my-environment --dag my_dag --run manual__2026-01-01T00:00:00+00:00
+smops airflow pools --profile dev --env my-environment
+smops airflow trigger --profile dev --env my-environment --dag my_dag --conf '{"run_date": "2026-01-01"}'
+```
+
+`airflow pools` shows pool slot usage (Airflow's concurrency "locks"). `airflow trigger`
+prompts for confirmation before starting a run; pass `--yes` (required with `--json`)
+to skip the prompt.
+
+To avoid repeating `--env`, set a default environment:
+
+```bash
+smops config set-mwaa-env my-environment
+smops config get-mwaa-env
+```
+
+The default can also be set with the `SMOPS_MWAA_ENVIRONMENT` environment variable,
+which overrides the config file.
+
+## Airflow TUI
+
+```bash
+smops tui airflow --profile dev --env my-environment
+```
+
+The Airflow TUI shows DAGs, the recent runs for the selected DAG, and pool usage,
+and it can load per-task states and trigger a DAG.
+
+Keyboard shortcuts:
+
+- `Left` / `Right`: switch focus between the DAGs and runs tables
+- `Up` / `Down`: move within the focused table
+- `l`: load task-instance states for the selected run
+- `t`: trigger the selected DAG
+- `p` / `P`: choose an AWS profile
+- `r`: refresh
+- `q`: quit
+
 ## Interactive TUI
 
 Open the TUI selector and choose between Pipelines and Processing Jobs:
@@ -250,6 +302,9 @@ smops pipeline steps --profile dev --region us-east-1 --execution-arn arn:aws:sa
 smops pipeline wait --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:...
 smops pipeline inspect --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:...
 smops pipeline diagnose --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:...
+smops airflow environments --profile dev --region ap-southeast-2
+smops airflow runs --profile dev --env my-environment --dag my_dag
+smops airflow pools --profile dev --env my-environment
 ```
 
 Most non-interactive commands support `--json` for agents and automation:
@@ -263,6 +318,8 @@ smops pipeline steps --profile dev --region us-east-1 --execution-arn arn:aws:sa
 smops pipeline wait --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:... --json
 smops pipeline inspect --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:... --json
 smops pipeline diagnose --profile dev --region us-east-1 --execution-arn arn:aws:sagemaker:... --json
+smops airflow runs --profile dev --env my-environment --dag my_dag --json
+smops airflow trigger --profile dev --env my-environment --dag my_dag --yes --json
 ```
 
 JSON responses use a stable envelope. Successful commands return `status: "ok"`; errors return `status: "error"` and a user-facing `error` message. List commands return `items`, `count`, and `next_token`.
