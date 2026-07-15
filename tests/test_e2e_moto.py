@@ -17,6 +17,7 @@ from sagemaker_ops.aws import (
     AirflowDagView,
     AirflowDagRunView,
     AirflowPoolView,
+    AirflowTaskInstanceView,
     AwsCliError,
     AwsContext,
     EcsClusterView,
@@ -1382,5 +1383,48 @@ def test_airflow_tui_search_filters_and_jumps(monkeypatch):
             await pilot.pause()
             assert app_under_test.search_query == ""
             assert table.row_count == 3
+
+    asyncio.run(run_app())
+
+
+def test_airflow_tui_refresh_preserves_run_selection_and_task_view(monkeypatch):
+    ctx = AwsContext("mock-dev", REGION, None, None, None, None)
+    runs = [
+        _airflow_run_view(run_id="manual__newest"),
+        _airflow_run_view(run_id="manual__older"),
+    ]
+    tasks = [
+        AirflowTaskInstanceView(
+            "mock-dev", REGION, "u-airflow2", "avm_end_to_end", "manual__older",
+            "get_date", "success", 1,
+            datetime(2026, 1, 1, tzinfo=timezone.utc), datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc), 60.0,
+        )
+    ]
+    monkeypatch.setattr(tui_module, "build_contexts", lambda *_a, **_k: [ctx])
+    monkeypatch.setattr(tui_module, "list_airflow_dags", lambda _ctx, _env: [_airflow_dag_view()])
+    monkeypatch.setattr(tui_module, "list_airflow_pools", lambda _ctx, _env: [])
+    monkeypatch.setattr(tui_module, "list_airflow_dag_runs", lambda _ctx, _env, _dag: runs)
+    monkeypatch.setattr(tui_module, "list_airflow_task_instances", lambda _ctx, _env, _dag, _run: tasks)
+
+    async def run_app() -> None:
+        app_under_test = AirflowApp(("mock-dev",), REGION, False, 60, "u-airflow2")
+        async with app_under_test.run_test(size=(160, 50)) as pilot:
+            await pilot.pause()
+            runs_table = app_under_test.query_one("#airflow-runs", DataTable)
+            assert runs_table.row_count == 2
+
+            # Select the second (older) run and load its task states.
+            runs_table.move_cursor(row=1)
+            assert app_under_test.selected_run().dag_run_id == "manual__older"
+            app_under_test.action_load_tasks()
+            await pilot.pause()
+            assert app_under_test._tasks_view_key == ("avm_end_to_end", "manual__older")
+
+            # A periodic refresh must keep the older run selected and stay in the
+            # task view rather than jumping to the newest run and the pools pane.
+            app_under_test.action_refresh()
+            await pilot.pause()
+            assert app_under_test.selected_run().dag_run_id == "manual__older"
+            assert app_under_test._tasks_view_key == ("avm_end_to_end", "manual__older")
 
     asyncio.run(run_app())

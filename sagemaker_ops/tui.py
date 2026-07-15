@@ -1100,10 +1100,21 @@ class AirflowApp(BaseSageMakerApp):
         self.selected_context: AwsContext | None = None
         self._rendering_dags = False
         self._rendering_runs = False
+        # Textual posts RowHighlighted asynchronously after a programmatic
+        # move_cursor, so a one-shot flag (not the _rendering guard) is needed to
+        # drop the stale highlight that would otherwise reload runs a second time.
+        self._suppress_next_dag_highlight = False
         # Keys identify which async result is current, so stale worker results are ignored.
         self._requested_runs_dag: str | None = None
         self._requested_tasks_key: tuple[str, str] | None = None
         self._refresh_previous_dag_id: str | None = None
+        # Selection/detail state preserved across the periodic refresh so the view
+        # updates in place instead of jumping back to the top run and the pools pane.
+        self._refresh_previous_run_id: str | None = None
+        self._pending_preferred_run_id: str | None = None
+        # (dag_id, run_id) the detail pane currently shows task instances for, or
+        # None when it shows pools. Drives whether a refresh reloads task states.
+        self._tasks_view_key: tuple[str, str] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1136,6 +1147,8 @@ class AirflowApp(BaseSageMakerApp):
             )
             return
         self._refresh_previous_dag_id = self.selected_dag().dag_id if self.selected_dag() else None
+        run = self.selected_run()
+        self._refresh_previous_run_id = run.dag_run_id if run else None
         self.query_one("#status", Static).update(
             f"Loading MWAA {self.environment}... Profile: {self.profile_label()}."
         )
@@ -1302,14 +1315,22 @@ class AirflowApp(BaseSageMakerApp):
                     key=str(index),
                 )
             if selected_index is not None and table.row_count:
+                self._suppress_next_dag_highlight = True
                 table.move_cursor(row=selected_index, scroll=False)
         finally:
             self._rendering_dags = False
+        # Carry the previously selected run into the upcoming runs reload so a
+        # periodic refresh keeps the user's place instead of jumping to row 0.
+        self._pending_preferred_run_id = self._refresh_previous_run_id
+        self._refresh_previous_run_id = None
         self.update_runs(selected_index)
 
     @on(DataTable.RowHighlighted, "#airflow-dags")
     def on_dag_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if self._rendering_dags:
+            return
+        if self._suppress_next_dag_highlight:
+            self._suppress_next_dag_highlight = False
             return
         try:
             self.update_runs(int(str(event.row_key.value)))
@@ -1342,10 +1363,15 @@ class AirflowApp(BaseSageMakerApp):
 
     def render_runs(self) -> None:
         table = self.query_one("#airflow-runs", DataTable)
+        preferred_run_id = self._pending_preferred_run_id
+        self._pending_preferred_run_id = None
+        selected_index = 0 if self.runs else None
         self._rendering_runs = True
         try:
             table.clear()
             for index, run in enumerate(self.runs):
+                if preferred_run_id and run.dag_run_id == preferred_run_id:
+                    selected_index = index
                 table.add_row(
                     run.dag_run_id,
                     run.state,
@@ -1354,11 +1380,24 @@ class AirflowApp(BaseSageMakerApp):
                     format_dt(run.start_date),
                     key=str(index),
                 )
-            if table.row_count:
-                table.move_cursor(row=0, scroll=False)
+            if selected_index is not None and table.row_count:
+                table.move_cursor(row=selected_index, scroll=False)
         finally:
             self._rendering_runs = False
-        self.render_pools()
+        # If the detail pane was showing task states for the still-selected run,
+        # reload them in place; otherwise show pools.
+        run = self.selected_run()
+        dag = self.selected_dag()
+        if (
+            self._tasks_view_key is not None
+            and dag is not None
+            and run is not None
+            and self._tasks_view_key == (dag.dag_id, run.dag_run_id)
+        ):
+            self.action_load_tasks()
+        else:
+            self._tasks_view_key = None
+            self.render_pools()
 
     def render_pools(self) -> None:
         detail = self.query_one("#airflow-detail", RichLog)
@@ -1400,6 +1439,9 @@ class AirflowApp(BaseSageMakerApp):
             detail.write("Select a DAG and a run first.")
             return
         self._requested_tasks_key = (dag.dag_id, run.dag_run_id)
+        # Remember that the detail pane is in task-view mode so the periodic
+        # refresh reloads task states in place instead of reverting to pools.
+        self._tasks_view_key = (dag.dag_id, run.dag_run_id)
         detail = self.query_one("#airflow-detail", RichLog)
         detail.clear()
         detail.write(f"Loading task instances for {run.dag_run_id}...")
