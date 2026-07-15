@@ -153,6 +153,12 @@ class BaseSageMakerApp(App[None]):
         width: 50%;
     }
 
+    #airflow-search {
+        display: none;
+        margin: 0 1;
+        border: tall $accent;
+    }
+
     .dialog {
         width: 70;
         height: auto;
@@ -1068,6 +1074,8 @@ class AirflowApp(BaseSageMakerApp):
         ("right", "focus_right", "Right"),
         ("l", "load_tasks", "Tasks"),
         Binding("t", "trigger_dag", "Trigger", priority=True),
+        Binding("/", "search_dags", "Search", priority=True),
+        Binding("escape", "clear_search", "Clear search", show=False, priority=True),
     ]
 
     def __init__(
@@ -1081,6 +1089,11 @@ class AirflowApp(BaseSageMakerApp):
         super().__init__(profiles, region, all_profiles, refresh_seconds)
         self.environment = environment
         self.dags: list[AirflowDagView] = []
+        # DAGs currently shown after applying the fuzzy search filter. All row
+        # operations index into this list, not self.dags.
+        self.filtered_dags: list[AirflowDagView] = []
+        self.search_query = ""
+        self.searching = False
         self.pools: list[AirflowPoolView] = []
         self.pools_error: str | None = None
         self.runs: list[AirflowDagRunView] = []
@@ -1097,6 +1110,7 @@ class AirflowApp(BaseSageMakerApp):
         yield Static("Loading...", id="status")
         with Vertical(id="airflow-content"):
             with Vertical(id="airflow-top"):
+                yield Input(placeholder="Fuzzy search DAGs — Enter to jump, Esc to clear", id="airflow-search")
                 dags = DataTable(id="airflow-dags")
                 dags.cursor_type = "row"
                 yield dags
@@ -1189,7 +1203,7 @@ class AirflowApp(BaseSageMakerApp):
             self.render_pools()
             self.query_one("#status", Static).update(
                 f"{len(self.dags)} DAG(s) in {self.environment}. Refresh every {self.refresh_seconds}s. "
-                f"Profile: {self.profile_label()}. Use arrows to move, l to load tasks, t to trigger."
+                f"Profile: {self.profile_label()}. Use arrows to move, / to search, l to load tasks, t to trigger."
             )
         elif name == "airflow-runs":
             dag_id, runs = event.worker.result
@@ -1217,13 +1231,66 @@ class AirflowApp(BaseSageMakerApp):
         else:
             self.query_one("#airflow-dags", DataTable).focus()
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
+        # While the search box is focused, let it own text keys. Only search-control
+        # actions stay live so single-letter bindings (r/l/t/p/q/s) don't fire as
+        # the user types a DAG name.
+        if self.searching and action not in {"clear_search", "search_dags"}:
+            return False
+        return True
+
+    def on_key(self, event) -> None:
+        # The base class grabs p/P/s as raw keys (not bindings), which would hijack
+        # typing in the search box. Let the focused Input consume everything except
+        # Escape while searching.
+        if self.searching:
+            if event.key == "escape":
+                event.stop()
+                self.action_clear_search()
+            return
+        super().on_key(event)
+
+    def action_search_dags(self) -> None:
+        self.searching = True
+        search = self.query_one("#airflow-search", Input)
+        search.styles.display = "block"
+        search.value = self.search_query
+        search.focus()
+
+    def action_clear_search(self) -> None:
+        if not self.searching and not self.search_query:
+            return
+        self.searching = False
+        self.search_query = ""
+        search = self.query_one("#airflow-search", Input)
+        search.value = ""
+        search.styles.display = "none"
+        self.render_dags()
+        self.query_one("#airflow-dags", DataTable).focus()
+
+    @on(Input.Changed, "#airflow-search")
+    def on_search_changed(self, event: Input.Changed) -> None:
+        self.search_query = event.value
+        self.render_dags()
+
+    @on(Input.Submitted, "#airflow-search")
+    def on_search_submitted(self, _: Input.Submitted) -> None:
+        # Jump to the current top match and return focus to the table.
+        self.searching = False
+        self.query_one("#airflow-search", Input).styles.display = "none"
+        table = self.query_one("#airflow-dags", DataTable)
+        if table.row_count:
+            table.move_cursor(row=0, scroll=True)
+        table.focus()
+
     def render_dags(self, preferred_dag_id: str | None = None) -> None:
         table = self.query_one("#airflow-dags", DataTable)
-        selected_index = 0 if self.dags else None
+        self.filtered_dags = _fuzzy_filter_dags(self.dags, self.search_query)
+        selected_index = 0 if self.filtered_dags else None
         self._rendering_dags = True
         try:
             table.clear()
-            for index, dag in enumerate(self.dags):
+            for index, dag in enumerate(self.filtered_dags):
                 if preferred_dag_id and dag.dag_id == preferred_dag_id:
                     selected_index = index
                 table.add_row(
@@ -1257,10 +1324,10 @@ class AirflowApp(BaseSageMakerApp):
             runs_table.clear()
         finally:
             self._rendering_runs = False
-        if index is None or index >= len(self.dags) or self.selected_context is None:
+        if index is None or index >= len(self.filtered_dags) or self.selected_context is None:
             self._requested_runs_dag = None
             return
-        dag = self.dags[index]
+        dag = self.filtered_dags[index]
         self._requested_runs_dag = dag.dag_id
         self.query_one("#airflow-detail", RichLog).clear()
         self.query_one("#airflow-detail", RichLog).write(f"Loading runs for {dag.dag_id}...")
@@ -1383,9 +1450,9 @@ class AirflowApp(BaseSageMakerApp):
 
     def selected_dag(self) -> AirflowDagView | None:
         table = self.query_one("#airflow-dags", DataTable)
-        if not self.dags or table.cursor_row >= len(self.dags):
+        if not self.filtered_dags or table.cursor_row >= len(self.filtered_dags):
             return None
-        return self.dags[table.cursor_row]
+        return self.filtered_dags[table.cursor_row]
 
     def selected_run(self) -> AirflowDagRunView | None:
         table = self.query_one("#airflow-runs", DataTable)
@@ -1602,4 +1669,43 @@ def _shorten(value: str, max_len: int) -> str:
     if len(value) <= max_len:
         return value
     return value[: max_len - 1] + "…"
+
+
+def _fuzzy_subsequence_score(query: str, target: str) -> int | None:
+    """Return a match score if every char of query appears in target in order.
+
+    Lower is better. Contiguous matches and matches near the start score better,
+    so "ame" ranks avm_end_to_end above a scattered match. Returns None on no match.
+    """
+    if not query:
+        return 0
+    score = 0
+    last_index = -1
+    start = 0
+    for char in query:
+        found = target.find(char, start)
+        if found == -1:
+            return None
+        # Penalize gaps between matched characters and distance from the start.
+        if last_index != -1:
+            score += found - last_index - 1
+        else:
+            score += found
+        last_index = found
+        start = found + 1
+    return score
+
+
+def _fuzzy_filter_dags(dags: list[AirflowDagView], query: str) -> list[AirflowDagView]:
+    """Filter and rank DAGs by a case-insensitive fuzzy match on dag_id."""
+    query = query.strip().lower()
+    if not query:
+        return list(dags)
+    scored: list[tuple[int, str, AirflowDagView]] = []
+    for dag in dags:
+        score = _fuzzy_subsequence_score(query, dag.dag_id.lower())
+        if score is not None:
+            scored.append((score, dag.dag_id, dag))
+    scored.sort(key=lambda item: (item[0], item[1]))
+    return [dag for _, _, dag in scored]
 

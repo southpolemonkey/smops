@@ -208,6 +208,7 @@ Keyboard shortcuts:
 
 - `Left` / `Right`: switch focus between the DAGs and runs tables
 - `Up` / `Down`: move within the focused table
+- `/`: fuzzy-search DAGs by name (type to filter, `Enter` to jump to the top match, `Esc` to clear)
 - `l`: load task-instance states for the selected run
 - `t`: trigger the selected DAG
 - `p` / `P`: choose an AWS profile

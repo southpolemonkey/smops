@@ -1322,3 +1322,65 @@ def test_airflow_tui_still_shows_dags_when_pools_forbidden(monkeypatch):
             assert "403" in (app_under_test.pools_error or "")
 
     asyncio.run(run_app())
+
+
+def test_fuzzy_filter_dags_matches_subsequence_and_ranks():
+    from sagemaker_ops.tui import _fuzzy_filter_dags
+
+    dags = [
+        _airflow_dag_view("avm_end_to_end"),
+        _airflow_dag_view("avm_report"),
+        _airflow_dag_view("avm_move_data"),
+        _airflow_dag_view("svp_avm"),
+    ]
+
+    assert [d.dag_id for d in _fuzzy_filter_dags(dags, "endto")] == ["avm_end_to_end"]
+    assert [d.dag_id for d in _fuzzy_filter_dags(dags, "avmre")] == ["avm_report"]
+    assert _fuzzy_filter_dags(dags, "zzz") == []
+    # Empty query returns everything, unranked (original order).
+    assert len(_fuzzy_filter_dags(dags, "")) == 4
+
+
+def test_airflow_tui_search_filters_and_jumps(monkeypatch):
+    ctx = AwsContext("mock-dev", REGION, None, None, None, None)
+    dags = [
+        _airflow_dag_view("avm_report"),
+        _airflow_dag_view("avm_move_data"),
+        _airflow_dag_view("avm_end_to_end"),
+    ]
+    monkeypatch.setattr(tui_module, "build_contexts", lambda *_a, **_k: [ctx])
+    monkeypatch.setattr(tui_module, "list_airflow_dags", lambda _ctx, _env: dags)
+    monkeypatch.setattr(tui_module, "list_airflow_pools", lambda _ctx, _env: [])
+    monkeypatch.setattr(tui_module, "list_airflow_dag_runs", lambda _ctx, _env, _dag: [])
+
+    async def run_app() -> None:
+        app_under_test = AirflowApp(("mock-dev",), REGION, False, 60, "u-airflow2")
+        async with app_under_test.run_test(size=(160, 50)) as pilot:
+            await pilot.pause()
+            table = app_under_test.query_one("#airflow-dags", DataTable)
+            assert table.row_count == 3
+
+            await pilot.press("slash")
+            await pilot.pause()
+            assert app_under_test.searching is True
+
+            for key in ["e", "n", "d", "t", "o"]:
+                await pilot.press(key)
+            await pilot.pause()
+            assert table.row_count == 1
+            assert app_under_test.selected_dag().dag_id == "avm_end_to_end"
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app_under_test.searching is False
+            assert app_under_test.selected_dag().dag_id == "avm_end_to_end"
+
+            # Escape clears the filter and restores the full list.
+            await pilot.press("slash")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app_under_test.search_query == ""
+            assert table.row_count == 3
+
+    asyncio.run(run_app())
