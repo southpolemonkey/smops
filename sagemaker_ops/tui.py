@@ -1082,6 +1082,7 @@ class AirflowApp(BaseSageMakerApp):
         self.environment = environment
         self.dags: list[AirflowDagView] = []
         self.pools: list[AirflowPoolView] = []
+        self.pools_error: str | None = None
         self.runs: list[AirflowDagRunView] = []
         self.selected_context: AwsContext | None = None
         self._rendering_dags = False
@@ -1133,13 +1134,23 @@ class AirflowApp(BaseSageMakerApp):
             exit_on_error=False,
         )
 
-    def _load_dags_and_pools(self) -> tuple[AwsContext | None, list[AirflowDagView], list[AirflowPoolView]]:
+    def _load_dags_and_pools(
+        self,
+    ) -> tuple[AwsContext | None, list[AirflowDagView], list[AirflowPoolView], str | None]:
         ctx = self.primary_context()
         if ctx is None or not self.environment:
-            return None, [], []
+            return None, [], [], None
         dags = list_airflow_dags(ctx, self.environment)
-        pools = list_airflow_pools(ctx, self.environment)
-        return ctx, dags, pools
+        # Pools require a separate Airflow RBAC permission; a role that can read
+        # DAGs may still get 403 on pools. Degrade gracefully so the DAG/run view
+        # keeps working instead of failing the whole refresh.
+        pools: list[AirflowPoolView] = []
+        pools_error: str | None = None
+        try:
+            pools = list_airflow_pools(ctx, self.environment)
+        except AwsCliError as exc:
+            pools_error = str(exc)
+        return ctx, dags, pools, pools_error
 
     def _load_runs(self) -> tuple[str, list[AirflowDagRunView]]:
         dag = self.selected_dag()
@@ -1169,10 +1180,11 @@ class AirflowApp(BaseSageMakerApp):
         if event.state != WorkerState.SUCCESS:
             return
         if name == "airflow-refresh":
-            ctx, dags, pools = event.worker.result
+            ctx, dags, pools, pools_error = event.worker.result
             self.selected_context = ctx
             self.dags = dags
             self.pools = pools
+            self.pools_error = pools_error
             self.render_dags(self._refresh_previous_dag_id)
             self.render_pools()
             self.query_one("#status", Static).update(
@@ -1285,7 +1297,9 @@ class AirflowApp(BaseSageMakerApp):
         detail = self.query_one("#airflow-detail", RichLog)
         detail.clear()
         detail.write("[bold]Pools[/bold]")
-        if not self.pools:
+        if self.pools_error:
+            detail.write(f"[yellow]Pools unavailable: {self.pools_error}[/yellow]")
+        elif not self.pools:
             detail.write("No pools.")
         for pool in self.pools:
             detail.write(

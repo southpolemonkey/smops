@@ -1297,3 +1297,28 @@ def test_airflow_tui_shows_dags(monkeypatch):
             assert app_under_test.selected_dag().dag_id == "avm_end_to_end"
 
     asyncio.run(run_app())
+
+
+def test_airflow_tui_still_shows_dags_when_pools_forbidden(monkeypatch):
+    # A role that can read DAGs may still get 403 on pools; the DAG view must survive.
+    ctx = AwsContext("mock-dev", REGION, None, None, None, None)
+    monkeypatch.setattr(tui_module, "build_contexts", lambda *_a, **_k: [ctx])
+    monkeypatch.setattr(tui_module, "list_airflow_dags", lambda _ctx, _env: [_airflow_dag_view()])
+    monkeypatch.setattr(tui_module, "list_airflow_dag_runs", lambda _ctx, _env, _dag: [_airflow_run_view()])
+
+    def forbidden_pools(_ctx, _env):
+        raise AwsCliError("Airflow API GET pools 返回 403: Forbidden")
+
+    monkeypatch.setattr(tui_module, "list_airflow_pools", forbidden_pools)
+
+    async def run_app() -> None:
+        app_under_test = AirflowApp(("mock-dev",), REGION, False, 60, "u-airflow2")
+        async with app_under_test.run_test(size=(160, 50)) as pilot:
+            await pilot.pause()
+            dags = app_under_test.query_one("#airflow-dags", DataTable)
+            assert dags.row_count == 1
+            assert app_under_test.selected_dag().dag_id == "avm_end_to_end"
+            assert app_under_test.pools == []
+            assert "403" in (app_under_test.pools_error or "")
+
+    asyncio.run(run_app())
