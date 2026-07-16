@@ -11,14 +11,20 @@
 
 Output demo/smops-demo.gif
 
+Require bash
+
 Set Shell "bash"
-Set FontFamily "JetBrains Mono"
-Set FontSize 24
-Set Width 1400
+Set FontSize 22
+Set Width 1280
 Set Height 900
 Set Padding 24
-Set Theme "Catppuccin Mocha"
+Set Margin 12
+Set MarginFill "#0f172a"
+Set BorderRadius 10
+Set WindowBar Colorful
 Set TypingSpeed 35ms
+Set Framerate 30
+Set Theme "Dracula"
 
 Type "clear"
 Enter
@@ -31,6 +37,14 @@ Enter
 Type "export SMOPS_DEMO_PIPELINE=${SMOPS_DEMO_PIPELINE:-demo-pipeline}"
 Enter
 Sleep 300ms
+
+Type "cd /Users/chenxuan.rong/projects/smops"
+Enter
+Sleep 700ms
+
+Type "source .venv/bin/activate"
+Enter
+Sleep 700ms
 
 Type "smops --help"
 Enter
