@@ -11,13 +11,27 @@ from rich.console import Console
 from rich.table import Table
 
 from sagemaker_ops import __version__
-from sagemaker_ops.config import config_path, get_default_region, load_config, resolve_region, set_default_region
+from sagemaker_ops.config import (
+    config_path,
+    get_default_mwaa_environment,
+    get_default_region,
+    load_config,
+    resolve_mwaa_environment,
+    resolve_region,
+    set_default_mwaa_environment,
+    set_default_region,
+)
 from sagemaker_ops.aws import (
     AwsCliError,
     build_contexts,
     describe_ecs_task,
     EcsTaskHistoryEntry,
+    list_airflow_dag_runs,
+    list_airflow_dags,
+    list_airflow_pools,
+    list_airflow_task_instances,
     list_ecs_task_history,
+    list_mwaa_environments,
     describe_pipeline_execution,
     describe_processing_job,
     diagnose_pipeline_execution,
@@ -35,10 +49,11 @@ from sagemaker_ops.aws import (
     start_pipeline_execution,
     submit_processing_job,
     tail_ecs_task_logs,
+    trigger_airflow_dag,
     wait_pipeline_execution,
     wait_processing_job,
 )
-from sagemaker_ops.tui import EcsTasksApp, ProcessingJobsApp, PipelineExecutionsApp, SmopsTuiApp
+from sagemaker_ops.tui import AirflowApp, EcsTasksApp, ProcessingJobsApp, PipelineExecutionsApp, SmopsTuiApp
 
 
 console = Console()
@@ -46,11 +61,13 @@ app = typer.Typer(help="SageMaker Processing Job and Pipeline operations CLI.", 
 processing_app = typer.Typer(help="Submit and inspect SageMaker Processing Jobs.", no_args_is_help=True)
 pipeline_app = typer.Typer(help="Start and inspect SageMaker Pipelines.", no_args_is_help=True)
 ecs_app = typer.Typer(help="Inspect Amazon ECS clusters, services, tasks, and logs.", no_args_is_help=True)
+airflow_app = typer.Typer(help="Monitor and trigger Amazon MWAA (Apache Airflow) DAGs.", no_args_is_help=True)
 tui_app = typer.Typer(help="Interactive TUI views.", invoke_without_command=True, no_args_is_help=False)
 config_app = typer.Typer(help="Manage smops defaults.", no_args_is_help=True)
 app.add_typer(processing_app, name="processing")
 app.add_typer(pipeline_app, name="pipeline")
 app.add_typer(ecs_app, name="ecs")
+app.add_typer(airflow_app, name="airflow")
 app.add_typer(tui_app, name="tui")
 app.add_typer(config_app, name="config")
 
@@ -102,6 +119,18 @@ def _effective_region(region: str | None) -> str | None:
         raise AwsCliError(str(exc)) from exc
 
 
+def _effective_mwaa_environment(environment: str | None) -> str:
+    try:
+        resolved = resolve_mwaa_environment(environment)
+    except ValueError as exc:
+        raise AwsCliError(str(exc)) from exc
+    if not resolved:
+        raise AwsCliError(
+            "No MWAA environment specified. Pass --env or run 'smops config set-mwaa-env <name>'."
+        )
+    return resolved
+
+
 @config_app.command("set-region")
 def config_set_region(
     region: Annotated[str, typer.Argument(help="Default AWS region for smops commands.")],
@@ -137,6 +166,43 @@ def config_get_region(
         console.print(region)
     else:
         console.print("No default region configured.")
+
+
+@config_app.command("set-mwaa-env")
+def config_set_mwaa_env(
+    environment: Annotated[str, typer.Argument(help="Default MWAA environment name for airflow commands.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """Set the default MWAA environment used by smops airflow commands."""
+    try:
+        set_default_mwaa_environment(environment)
+    except ValueError as exc:
+        _exit_error(AwsCliError(str(exc)), json_output)
+    payload = {"status": "ok", "mwaa_environment": environment, "config_path": str(config_path())}
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(f"Default MWAA environment set to [bold]{environment}[/bold]")
+    console.print(f"Config: {config_path()}")
+
+
+@config_app.command("get-mwaa-env")
+def config_get_mwaa_env(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """Print the configured default MWAA environment."""
+    try:
+        environment = get_default_mwaa_environment()
+    except ValueError as exc:
+        _exit_error(AwsCliError(str(exc)), json_output)
+    payload = {"status": "ok", "mwaa_environment": environment, "config_path": str(config_path())}
+    if json_output:
+        _print_json(payload)
+        return
+    if environment:
+        console.print(environment)
+    else:
+        console.print("No default MWAA environment configured.")
 
 
 @config_app.command("show")
@@ -779,6 +845,229 @@ def ecs_history(
     console.print(table)
 
 
+@airflow_app.command("environments")
+def airflow_environments(
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """List Amazon MWAA environments."""
+    try:
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
+        environments = list_mwaa_environments(ctx)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({"status": "ok", "profile": ctx.profile, "region": ctx.region, "items": environments, "count": len(environments)})
+        return
+
+    if not environments:
+        console.print("[yellow]No MWAA environments found.[/yellow]")
+        return
+    table = Table("Profile", "Region", "Environment", "Status", "Airflow", "Schedulers")
+    for environment in environments:
+        table.add_row(
+            environment.profile,
+            environment.region,
+            environment.name,
+            environment.status,
+            environment.airflow_version,
+            "" if environment.schedulers is None else str(environment.schedulers),
+        )
+    console.print(table)
+
+
+@airflow_app.command("dags")
+def airflow_dags(
+    environment: Annotated[str | None, typer.Option("--env", "-e", help="MWAA environment name.")] = None,
+    pattern: Annotated[str | None, typer.Option("--pattern", help="Filter DAGs whose dag_id contains this text.")] = None,
+    limit: Annotated[int, typer.Option("--limit", min=1, max=100, help="Max DAGs to return.")] = 100,
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """List Airflow DAGs in an MWAA environment."""
+    try:
+        env = _effective_mwaa_environment(environment)
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
+        dags = list_airflow_dags(ctx, env, name_pattern=pattern, limit=limit)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({"status": "ok", "profile": ctx.profile, "region": ctx.region, "environment": env, "items": dags, "count": len(dags)})
+        return
+
+    if not dags:
+        console.print(f"[yellow]No DAGs found in {env}.[/yellow]")
+        return
+    table = Table("DAG", "Paused", "Active", "Schedule", "Owners", "Tags")
+    for dag in dags:
+        table.add_row(
+            dag.dag_id,
+            "yes" if dag.is_paused else "no",
+            "yes" if dag.is_active else "no",
+            dag.schedule_interval,
+            ", ".join(dag.owners),
+            ", ".join(dag.tags),
+        )
+    console.print(table)
+
+
+@airflow_app.command("runs")
+def airflow_runs(
+    dag: Annotated[str, typer.Option("--dag", "-d", help="DAG id.")],
+    environment: Annotated[str | None, typer.Option("--env", "-e", help="MWAA environment name.")] = None,
+    limit: Annotated[int, typer.Option("--limit", min=1, max=100, help="Max recent runs to return.")] = 10,
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """List recent runs for one Airflow DAG."""
+    try:
+        env = _effective_mwaa_environment(environment)
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
+        runs = list_airflow_dag_runs(ctx, env, dag, limit=limit)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({"status": "ok", "profile": ctx.profile, "region": ctx.region, "environment": env, "dag_id": dag, "items": runs, "count": len(runs)})
+        return
+
+    if not runs:
+        console.print(f"[yellow]No runs found for DAG {dag} in {env}.[/yellow]")
+        return
+    table = Table("Run", "State", "Type", "Runtime", "Started", "Trigger")
+    for run in runs:
+        table.add_row(
+            run.dag_run_id,
+            run.state,
+            run.run_type,
+            format_duration(run.start_date, run.end_date),
+            format_dt(run.start_date),
+            "external" if run.external_trigger else "scheduled",
+        )
+    console.print(table)
+
+
+@airflow_app.command("tasks")
+def airflow_tasks(
+    dag: Annotated[str, typer.Option("--dag", "-d", help="DAG id.")],
+    run: Annotated[str, typer.Option("--run", help="DAG run id.")],
+    environment: Annotated[str | None, typer.Option("--env", "-e", help="MWAA environment name.")] = None,
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """List task-instance states for one Airflow DAG run."""
+    try:
+        env = _effective_mwaa_environment(environment)
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
+        instances = list_airflow_task_instances(ctx, env, dag, run)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({"status": "ok", "profile": ctx.profile, "region": ctx.region, "environment": env, "dag_id": dag, "dag_run_id": run, "items": instances, "count": len(instances)})
+        return
+
+    if not instances:
+        console.print(f"[yellow]No task instances found for run {run}.[/yellow]")
+        return
+    table = Table("Task", "State", "Try", "Runtime", "Started")
+    for instance in instances:
+        table.add_row(
+            instance.task_id,
+            instance.state,
+            "" if instance.try_number is None else str(instance.try_number),
+            format_duration(instance.start_date, instance.end_date),
+            format_dt(instance.start_date),
+        )
+    console.print(table)
+
+
+@airflow_app.command("pools")
+def airflow_pools(
+    environment: Annotated[str | None, typer.Option("--env", "-e", help="MWAA environment name.")] = None,
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """List Airflow pool slot usage."""
+    try:
+        env = _effective_mwaa_environment(environment)
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
+        pools = list_airflow_pools(ctx, env)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({"status": "ok", "profile": ctx.profile, "region": ctx.region, "environment": env, "items": pools, "count": len(pools)})
+        return
+
+    if not pools:
+        console.print(f"[yellow]No pools found in {env}.[/yellow]")
+        return
+    table = Table("Pool", "Slots", "Occupied", "Running", "Queued", "Open")
+    for pool in pools:
+        table.add_row(
+            pool.name,
+            str(pool.slots),
+            str(pool.occupied_slots),
+            str(pool.running_slots),
+            str(pool.queued_slots),
+            str(pool.open_slots),
+        )
+    console.print(table)
+
+
+@airflow_app.command("trigger")
+def airflow_trigger(
+    dag: Annotated[str, typer.Option("--dag", "-d", help="DAG id.")],
+    environment: Annotated[str | None, typer.Option("--env", "-e", help="MWAA environment name.")] = None,
+    conf: Annotated[str | None, typer.Option("--conf", help="Run configuration as a JSON object.")] = None,
+    logical_date: Annotated[str | None, typer.Option("--logical-date", help="Logical date in ISO 8601. Defaults to now.")] = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
+    profile: Annotated[str | None, typer.Option("--profile", "-p", help="AWS profile.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON only.")] = False,
+) -> None:
+    """Trigger a new run of an Airflow DAG."""
+    try:
+        env = _effective_mwaa_environment(environment)
+        conf_payload = _parse_trigger_conf(conf)
+        if not yes:
+            if json_output:
+                raise AwsCliError("--json trigger requires --yes to skip the confirmation prompt.")
+            if not typer.confirm(f"Trigger DAG '{dag}' in environment '{env}'?"):
+                console.print("Aborted.")
+                raise typer.Exit(0)
+        ctx = build_contexts((profile,) if profile else (), _effective_region(region))[0]
+        run = trigger_airflow_dag(ctx, env, dag, conf=conf_payload, logical_date=logical_date)
+    except AwsCliError as exc:
+        _exit_error(exc, json_output)
+
+    if json_output:
+        _print_json({"status": "ok", "profile": ctx.profile, "region": ctx.region, "environment": env, "dag_id": dag, "dag_run": run})
+        return
+    console.print(f"[green]Triggered DAG[/green] {dag}")
+    console.print(f"Run: {run.dag_run_id} ({run.state})")
+
+
+def _parse_trigger_conf(conf: str | None) -> dict[str, Any] | None:
+    if conf is None:
+        return None
+    try:
+        parsed = json.loads(conf)
+    except json.JSONDecodeError as exc:
+        raise AwsCliError(f"--conf must be a valid JSON object: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise AwsCliError("--conf must be a JSON object")
+    return parsed
+
+
 @tui_app.callback(invoke_without_command=True)
 def tui_main(
     ctx: typer.Context,
@@ -787,6 +1076,7 @@ def tui_main(
     all_profiles: Annotated[bool, typer.Option("--all-profiles", help="Inspect all local AWS profiles.")] = False,
     refresh: Annotated[int, typer.Option("--refresh", min=5, max=300, help="Refresh interval in seconds.")] = 15,
     hours: Annotated[int, typer.Option("--hours", min=1, max=168, help="Include pipeline executions completed within this many hours.")] = 3,
+    environment: Annotated[str | None, typer.Option("--env", help="MWAA environment name for the airflow view.")] = None,
 ) -> None:
     """Open the smops TUI selector when no TUI subcommand is provided."""
     if ctx.invoked_subcommand is not None:
@@ -798,6 +1088,8 @@ def tui_main(
         PipelineExecutionsApp(tuple(profile or ()), _effective_region(region), all_profiles, refresh, None, hours).run()
     elif selected == "ecs":
         EcsTasksApp(tuple(profile or ()), _effective_region(region), all_profiles, refresh).run()
+    elif selected == "airflow":
+        AirflowApp(tuple(profile or ()), _effective_region(region), all_profiles, refresh, resolve_mwaa_environment(environment)).run()
 
 
 @tui_app.command("processing")
@@ -820,6 +1112,18 @@ def tui_ecs(
 ) -> None:
     """Interactively inspect ECS clusters, services, running tasks, and logs."""
     EcsTasksApp(tuple(profile or ()), _effective_region(region), all_profiles, refresh).run()
+
+
+@tui_app.command("airflow")
+def tui_airflow(
+    environment: Annotated[str | None, typer.Option("--env", "-e", help="MWAA environment name.")] = None,
+    profile: Annotated[list[str] | None, typer.Option("--profile", "-p", help="AWS profile. Can be passed multiple times.")] = None,
+    region: Annotated[str | None, typer.Option("--region", "-r", help="AWS region.")] = None,
+    all_profiles: Annotated[bool, typer.Option("--all-profiles", help="Inspect all local AWS profiles.")] = False,
+    refresh: Annotated[int, typer.Option("--refresh", min=5, max=300, help="Refresh interval in seconds.")] = 15,
+) -> None:
+    """Interactively inspect MWAA DAGs, runs, task instances, and pools."""
+    AirflowApp(tuple(profile or ()), _effective_region(region), all_profiles, refresh, resolve_mwaa_environment(environment)).run()
 
 
 @tui_app.command("pipelines")

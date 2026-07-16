@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import boto3
+import requests
 from botocore.exceptions import BotoCoreError, ClientError
 
 
@@ -31,6 +32,7 @@ class AwsContext:
     sagemaker: Any
     logs: Any
     ecs: Any = None
+    mwaa: Any = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +134,74 @@ class EcsTaskHistoryEntry:
     started_at: datetime
     ended_at: datetime
     duration_seconds: float
+
+
+@dataclass(frozen=True)
+class MwaaEnvironmentView:
+    profile: str
+    region: str
+    name: str
+    status: str
+    airflow_version: str
+    webserver_url: str
+    schedulers: int | None
+
+
+@dataclass(frozen=True)
+class AirflowDagView:
+    profile: str
+    region: str
+    environment: str
+    dag_id: str
+    is_paused: bool
+    is_active: bool
+    schedule_interval: str
+    owners: list[str]
+    tags: list[str]
+    description: str
+
+
+@dataclass(frozen=True)
+class AirflowDagRunView:
+    profile: str
+    region: str
+    environment: str
+    dag_id: str
+    dag_run_id: str
+    state: str
+    run_type: str
+    logical_date: datetime | None
+    start_date: datetime | None
+    end_date: datetime | None
+    external_trigger: bool
+
+
+@dataclass(frozen=True)
+class AirflowTaskInstanceView:
+    profile: str
+    region: str
+    environment: str
+    dag_id: str
+    dag_run_id: str
+    task_id: str
+    state: str
+    try_number: int | None
+    start_date: datetime | None
+    end_date: datetime | None
+    duration: float | None
+
+
+@dataclass(frozen=True)
+class AirflowPoolView:
+    profile: str
+    region: str
+    environment: str
+    name: str
+    slots: int
+    occupied_slots: int
+    running_slots: int
+    queued_slots: int
+    open_slots: int
 
 
 def list_ecs_task_history(
@@ -386,6 +456,265 @@ def _chunks(items: list[Any], size: int) -> Iterable[list[Any]]:
         yield items[index : index + size]
 
 
+# --- Amazon MWAA / Apache Airflow ------------------------------------------
+#
+# MWAA's boto3 client only exposes list/get environment and create_web_login_token.
+# DAG, run, task, and pool data live behind the Airflow REST API on the private
+# web server. Access flow: create a short-lived web login token, POST it to
+# /aws_mwaa/login to obtain a session cookie, then call /api/v1/... with the
+# cookie. Tokens expire quickly, so a fresh session is created per call.
+
+AIRFLOW_REQUEST_TIMEOUT = 30
+
+
+def list_mwaa_environments(ctx: AwsContext) -> list[MwaaEnvironmentView]:
+    try:
+        paginator = ctx.mwaa.get_paginator("list_environments")
+        names: list[str] = []
+        for page in paginator.paginate():
+            names.extend(page.get("Environments", []))
+    except (BotoCoreError, ClientError) as exc:
+        raise AwsCliError(f"读取 MWAA environments 失败: {exc}") from exc
+
+    environments: list[MwaaEnvironmentView] = []
+    for name in names:
+        try:
+            detail = ctx.mwaa.get_environment(Name=name).get("Environment", {})
+        except (BotoCoreError, ClientError) as exc:
+            raise AwsCliError(f"读取 MWAA environment 失败 name={name}: {exc}") from exc
+        environments.append(
+            MwaaEnvironmentView(
+                profile=ctx.profile,
+                region=ctx.region,
+                name=detail.get("Name", name),
+                status=detail.get("Status", ""),
+                airflow_version=detail.get("AirflowVersion", ""),
+                webserver_url=detail.get("WebserverUrl", ""),
+                schedulers=detail.get("Schedulers"),
+            )
+        )
+    return sorted(environments, key=lambda item: item.name)
+
+
+def _airflow_session(ctx: AwsContext, environment: str) -> tuple[requests.Session, str]:
+    """Create an authenticated requests.Session for the Airflow web server.
+
+    Exchanges a fresh MWAA web login token for a session cookie. Returns the
+    session (carrying the cookie) plus the web server hostname.
+    """
+    try:
+        response = ctx.mwaa.create_web_login_token(Name=environment)
+    except (BotoCoreError, ClientError) as exc:
+        raise AwsCliError(f"创建 MWAA web login token 失败 env={environment}: {exc}") from exc
+
+    token = response.get("WebToken")
+    host = response.get("WebServerHostname")
+    if not token or not host:
+        raise AwsCliError(f"MWAA 未返回 web login token 或 hostname: env={environment}")
+
+    session = requests.Session()
+    try:
+        login = session.post(
+            f"https://{host}/aws_mwaa/login",
+            data={"token": token},
+            timeout=AIRFLOW_REQUEST_TIMEOUT,
+            allow_redirects=True,
+        )
+        login.raise_for_status()
+    except requests.RequestException as exc:
+        raise AwsCliError(f"登录 Airflow web server 失败 env={environment}: {exc}") from exc
+    return session, host
+
+
+def _airflow_get(session: requests.Session, host: str, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    return _airflow_request(session, host, "GET", path, params=params)
+
+
+def _airflow_request(
+    session: requests.Session,
+    host: str,
+    method: str,
+    path: str,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    url = f"https://{host}/api/v1/{path.lstrip('/')}"
+    try:
+        response = session.request(
+            method,
+            url,
+            params=params,
+            json=json_body,
+            timeout=AIRFLOW_REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise AwsCliError(f"调用 Airflow API 失败 {method} {path}: {exc}") from exc
+
+    if response.status_code >= 400:
+        detail = ""
+        try:
+            payload = response.json()
+            detail = payload.get("detail") or payload.get("title") or ""
+        except ValueError:
+            detail = response.text[:200]
+        raise AwsCliError(f"Airflow API {method} {path} 返回 {response.status_code}: {detail}")
+
+    if not response.content:
+        return {}
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise AwsCliError(f"Airflow API {method} {path} 返回非 JSON 响应") from exc
+
+
+def list_airflow_dags(
+    ctx: AwsContext,
+    environment: str,
+    name_pattern: str | None = None,
+    limit: int = 100,
+) -> list[AirflowDagView]:
+    session, host = _airflow_session(ctx, environment)
+    params: dict[str, Any] = {"limit": max(1, min(limit, 100))}
+    if name_pattern:
+        params["dag_id_pattern"] = name_pattern
+    payload = _airflow_get(session, host, "dags", params=params)
+    dags = [
+        AirflowDagView(
+            profile=ctx.profile,
+            region=ctx.region,
+            environment=environment,
+            dag_id=dag.get("dag_id", ""),
+            is_paused=bool(dag.get("is_paused", False)),
+            is_active=bool(dag.get("is_active", False)),
+            schedule_interval=_format_schedule_interval(dag.get("schedule_interval")),
+            owners=list(dag.get("owners", []) or []),
+            tags=[tag.get("name", "") for tag in dag.get("tags", []) or []],
+            description=dag.get("description") or "",
+        )
+        for dag in payload.get("dags", [])
+    ]
+    return sorted(dags, key=lambda item: item.dag_id)
+
+
+def list_airflow_dag_runs(
+    ctx: AwsContext,
+    environment: str,
+    dag_id: str,
+    limit: int = 10,
+) -> list[AirflowDagRunView]:
+    session, host = _airflow_session(ctx, environment)
+    params = {"limit": max(1, min(limit, 100)), "order_by": "-execution_date"}
+    payload = _airflow_get(session, host, f"dags/{dag_id}/dagRuns", params=params)
+    return [_airflow_dag_run_view(ctx, environment, dag_id, run) for run in payload.get("dag_runs", [])]
+
+
+def list_airflow_task_instances(
+    ctx: AwsContext,
+    environment: str,
+    dag_id: str,
+    dag_run_id: str,
+) -> list[AirflowTaskInstanceView]:
+    session, host = _airflow_session(ctx, environment)
+    payload = _airflow_get(session, host, f"dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances")
+    instances = [
+        AirflowTaskInstanceView(
+            profile=ctx.profile,
+            region=ctx.region,
+            environment=environment,
+            dag_id=dag_id,
+            dag_run_id=dag_run_id,
+            task_id=instance.get("task_id", ""),
+            state=instance.get("state") or "",
+            try_number=instance.get("try_number"),
+            start_date=_parse_airflow_dt(instance.get("start_date")),
+            end_date=_parse_airflow_dt(instance.get("end_date")),
+            duration=instance.get("duration"),
+        )
+        for instance in payload.get("task_instances", [])
+    ]
+    return sorted(instances, key=lambda item: item.start_date or datetime.min.replace(tzinfo=timezone.utc))
+
+
+def list_airflow_pools(ctx: AwsContext, environment: str) -> list[AirflowPoolView]:
+    session, host = _airflow_session(ctx, environment)
+    payload = _airflow_get(session, host, "pools")
+    pools = [
+        AirflowPoolView(
+            profile=ctx.profile,
+            region=ctx.region,
+            environment=environment,
+            name=pool.get("name", ""),
+            slots=pool.get("slots", 0),
+            occupied_slots=pool.get("occupied_slots", 0),
+            running_slots=pool.get("running_slots", 0),
+            queued_slots=pool.get("queued_slots", 0),
+            open_slots=pool.get("open_slots", 0),
+        )
+        for pool in payload.get("pools", [])
+    ]
+    return sorted(pools, key=lambda item: item.name)
+
+
+def trigger_airflow_dag(
+    ctx: AwsContext,
+    environment: str,
+    dag_id: str,
+    conf: dict[str, Any] | None = None,
+    logical_date: str | None = None,
+) -> AirflowDagRunView:
+    session, host = _airflow_session(ctx, environment)
+    body: dict[str, Any] = {}
+    if conf is not None:
+        body["conf"] = conf
+    if logical_date:
+        body["logical_date"] = logical_date
+    payload = _airflow_request(session, host, "POST", f"dags/{dag_id}/dagRuns", json_body=body)
+    return _airflow_dag_run_view(ctx, environment, dag_id, payload)
+
+
+def _airflow_dag_run_view(
+    ctx: AwsContext,
+    environment: str,
+    dag_id: str,
+    run: dict[str, Any],
+) -> AirflowDagRunView:
+    return AirflowDagRunView(
+        profile=ctx.profile,
+        region=ctx.region,
+        environment=environment,
+        dag_id=run.get("dag_id", dag_id),
+        dag_run_id=run.get("dag_run_id", ""),
+        state=run.get("state") or "",
+        run_type=run.get("run_type", ""),
+        logical_date=_parse_airflow_dt(run.get("logical_date")),
+        start_date=_parse_airflow_dt(run.get("start_date")),
+        end_date=_parse_airflow_dt(run.get("end_date")),
+        external_trigger=bool(run.get("external_trigger", False)),
+    )
+
+
+def _format_schedule_interval(schedule_interval: Any) -> str:
+    if schedule_interval is None:
+        return ""
+    if isinstance(schedule_interval, dict):
+        # Airflow returns e.g. {"__type": "CronExpression", "value": "0 * * * *"}.
+        return str(schedule_interval.get("value", schedule_interval))
+    return str(schedule_interval)
+
+
+def _parse_airflow_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def load_job_spec(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise AwsCliError(f"配置文件不存在: {path}")
@@ -454,6 +783,7 @@ def build_contexts(
                     sagemaker=session.client("sagemaker"),
                     logs=session.client("logs"),
                     ecs=session.client("ecs"),
+                    mwaa=session.client("mwaa"),
                 )
             )
         except (BotoCoreError, ClientError) as exc:

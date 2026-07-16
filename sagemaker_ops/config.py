@@ -8,6 +8,7 @@ from typing import Any
 
 CONFIG_FILE_ENV = "SMOPS_CONFIG_FILE"
 DEFAULT_REGION_ENV = "SMOPS_DEFAULT_REGION"
+DEFAULT_MWAA_ENVIRONMENT_ENV = "SMOPS_MWAA_ENVIRONMENT"
 
 
 def config_path() -> Path:
@@ -55,3 +56,21 @@ def set_default_region(region: str) -> None:
 
 def resolve_region(region: str | None) -> str | None:
     return region or get_default_region()
+
+
+def get_default_mwaa_environment() -> str | None:
+    env_value = os.environ.get(DEFAULT_MWAA_ENVIRONMENT_ENV)
+    if env_value:
+        return env_value
+    value = load_config().get("mwaa_environment")
+    return value if isinstance(value, str) and value else None
+
+
+def set_default_mwaa_environment(environment: str) -> None:
+    config = load_config()
+    config["mwaa_environment"] = environment
+    save_config(config)
+
+
+def resolve_mwaa_environment(environment: str | None) -> str | None:
+    return environment or get_default_mwaa_environment()

@@ -14,6 +14,10 @@ from typer.testing import CliRunner
 import sagemaker_ops.cli as cli_module
 import sagemaker_ops.tui as tui_module
 from sagemaker_ops.aws import (
+    AirflowDagView,
+    AirflowDagRunView,
+    AirflowPoolView,
+    AirflowTaskInstanceView,
     AwsCliError,
     AwsContext,
     EcsClusterView,
@@ -21,6 +25,10 @@ from sagemaker_ops.aws import (
     EcsTaskView,
     build_contexts,
     list_active_pipeline_executions,
+    list_airflow_dag_runs,
+    list_airflow_dags,
+    list_airflow_pools,
+    list_mwaa_environments,
     list_ecs_clusters,
     list_ecs_services,
     list_ecs_tasks,
@@ -33,8 +41,9 @@ from sagemaker_ops.aws import (
     tail_processing_job_logs,
     tail_step_logs,
 )
+import sagemaker_ops.aws as aws_module
 from sagemaker_ops.cli import app
-from sagemaker_ops.tui import EcsTasksApp, PipelineExecutionsApp, ProcessingJobsApp, SmopsTuiApp
+from sagemaker_ops.tui import AirflowApp, EcsTasksApp, PipelineExecutionsApp, ProcessingJobsApp, SmopsTuiApp
 
 from .conftest import (
     ACCOUNT_ID,
@@ -45,6 +54,7 @@ from .conftest import (
     pipeline_steps,
     processing_job_spec,
     seed_failed_step_logs,
+    stubbed_mwaa_context,
 )
 
 
@@ -666,7 +676,7 @@ def test_smops_tui_home_selects_processing_view():
         async with app_under_test.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             table = app_under_test.query_one("#home", DataTable)
-            assert table.row_count == 3
+            assert table.row_count == 4
             await pilot.press("down")
             await pilot.press("enter")
             assert app_under_test.return_value == "processing"
@@ -761,7 +771,7 @@ def test_smops_tui_home_selects_ecs_view():
         async with app_under_test.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             table = app_under_test.query_one("#home", DataTable)
-            assert table.row_count == 3
+            assert table.row_count == 4
             await pilot.press("down")
             await pilot.press("down")
             await pilot.press("enter")
@@ -985,5 +995,436 @@ def test_pipeline_tui_shows_executions_steps_and_loads_failed_logs(
             assert steps.cursor_row == 1
             assert app_under_test.selected_step()["StepName"] == "ValidateData"
             assert app_under_test.loaded_log_step_key == (execution_arn, "ValidateData")
+
+    asyncio.run(run_app())
+
+
+# --- Airflow / MWAA ---------------------------------------------------------
+
+
+def _airflow_dag_view(dag_id: str = "avm_end_to_end", paused: bool = False) -> AirflowDagView:
+    return AirflowDagView(
+        profile="mock-dev",
+        region=REGION,
+        environment="u-airflow2",
+        dag_id=dag_id,
+        is_paused=paused,
+        is_active=True,
+        schedule_interval="0 * * * *",
+        owners=["airflow"],
+        tags=["avm"],
+        description="AVM end to end",
+    )
+
+
+def _airflow_run_view(dag_id: str = "avm_end_to_end", run_id: str = "manual__2026-01-01") -> AirflowDagRunView:
+    return AirflowDagRunView(
+        profile="mock-dev",
+        region=REGION,
+        environment="u-airflow2",
+        dag_id=dag_id,
+        dag_run_id=run_id,
+        state="success",
+        run_type="manual",
+        logical_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        start_date=datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc),
+        end_date=datetime(2026, 1, 1, 0, 10, tzinfo=timezone.utc),
+        external_trigger=True,
+    )
+
+
+def test_list_mwaa_environments_via_stubber():
+    ctx, stubber = stubbed_mwaa_context()
+    stubber.add_response("list_environments", {"Environments": ["u-airflow2"]}, {})
+    stubber.add_response(
+        "get_environment",
+        {
+            "Environment": {
+                "Name": "u-airflow2",
+                "Status": "AVAILABLE",
+                "AirflowVersion": "2.7.2",
+                "WebserverUrl": "https://example-vpce.airflow.amazonaws.com",
+                "Schedulers": 2,
+            }
+        },
+        {"Name": "u-airflow2"},
+    )
+
+    with stubber:
+        environments = list_mwaa_environments(ctx)
+
+    assert len(environments) == 1
+    assert environments[0].name == "u-airflow2"
+    assert environments[0].status == "AVAILABLE"
+    assert environments[0].airflow_version == "2.7.2"
+    assert environments[0].schedulers == 2
+
+
+def test_list_airflow_dags_parses_rest_payload(monkeypatch):
+    ctx, _ = stubbed_mwaa_context()
+    monkeypatch.setattr(aws_module, "_airflow_session", lambda _ctx, _env: (None, "host"))
+    payload = {
+        "dags": [
+            {
+                "dag_id": "avm_end_to_end",
+                "is_paused": False,
+                "is_active": True,
+                "schedule_interval": {"__type": "CronExpression", "value": "0 * * * *"},
+                "owners": ["airflow"],
+                "tags": [{"name": "avm"}],
+                "description": "AVM end to end",
+            }
+        ]
+    }
+    monkeypatch.setattr(aws_module, "_airflow_get", lambda _s, _h, _path, params=None: payload)
+
+    dags = list_airflow_dags(ctx, "u-airflow2", name_pattern="avm")
+
+    assert len(dags) == 1
+    assert dags[0].dag_id == "avm_end_to_end"
+    assert dags[0].schedule_interval == "0 * * * *"
+    assert dags[0].tags == ["avm"]
+    assert dags[0].owners == ["airflow"]
+
+
+def test_list_airflow_dag_runs_parses_states(monkeypatch):
+    ctx, _ = stubbed_mwaa_context()
+    monkeypatch.setattr(aws_module, "_airflow_session", lambda _ctx, _env: (None, "host"))
+    payload = {
+        "dag_runs": [
+            {
+                "dag_id": "avm_end_to_end",
+                "dag_run_id": "manual__2026-01-01",
+                "state": "failed",
+                "run_type": "manual",
+                "logical_date": "2026-01-01T00:00:00+00:00",
+                "start_date": "2026-01-01T00:00:00+00:00",
+                "end_date": "2026-01-01T00:10:00+00:00",
+                "external_trigger": True,
+            }
+        ]
+    }
+    monkeypatch.setattr(aws_module, "_airflow_get", lambda _s, _h, _path, params=None: payload)
+
+    runs = list_airflow_dag_runs(ctx, "u-airflow2", "avm_end_to_end")
+
+    assert len(runs) == 1
+    assert runs[0].state == "failed"
+    assert runs[0].external_trigger is True
+    assert runs[0].start_date == datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+
+
+def test_list_airflow_pools_parses_slots(monkeypatch):
+    ctx, _ = stubbed_mwaa_context()
+    monkeypatch.setattr(aws_module, "_airflow_session", lambda _ctx, _env: (None, "host"))
+    payload = {
+        "pools": [
+            {
+                "name": "default_pool",
+                "slots": 10000,
+                "occupied_slots": 20,
+                "running_slots": 0,
+                "queued_slots": 20,
+                "open_slots": 9980,
+            }
+        ]
+    }
+    monkeypatch.setattr(aws_module, "_airflow_get", lambda _s, _h, _path, params=None: payload)
+
+    pools = list_airflow_pools(ctx, "u-airflow2")
+
+    assert len(pools) == 1
+    assert pools[0].name == "default_pool"
+    assert pools[0].open_slots == 9980
+
+
+def test_airflow_cli_runs_json(monkeypatch):
+    ctx = AwsContext("mock-dev", REGION, None, None, None, None)
+    monkeypatch.setattr(cli_module, "build_contexts", lambda *_a, **_k: [ctx])
+    monkeypatch.setattr(cli_module, "list_airflow_dag_runs", lambda _ctx, _env, _dag, limit=10: [_airflow_run_view()])
+
+    result = runner.invoke(
+        app,
+        ["airflow", "runs", "--dag", "avm_end_to_end", "--env", "u-airflow2", "--region", REGION, "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ok"
+    assert payload["environment"] == "u-airflow2"
+    assert payload["count"] == 1
+    assert payload["items"][0]["dag_run_id"] == "manual__2026-01-01"
+
+
+def test_airflow_cli_dags_table(monkeypatch):
+    ctx = AwsContext("mock-dev", REGION, None, None, None, None)
+    monkeypatch.setattr(cli_module, "build_contexts", lambda *_a, **_k: [ctx])
+    monkeypatch.setattr(cli_module, "list_airflow_dags", lambda _ctx, _env, name_pattern=None, limit=100: [_airflow_dag_view()])
+
+    result = runner.invoke(app, ["airflow", "dags", "--env", "u-airflow2", "--region", REGION])
+
+    assert result.exit_code == 0, result.output
+    assert "avm_end_to_end" in result.output
+
+
+def test_airflow_cli_requires_environment(monkeypatch):
+    ctx = AwsContext("mock-dev", REGION, None, None, None, None)
+    monkeypatch.setattr(cli_module, "build_contexts", lambda *_a, **_k: [ctx])
+    monkeypatch.delenv("SMOPS_MWAA_ENVIRONMENT", raising=False)
+
+    result = runner.invoke(app, ["airflow", "pools", "--region", REGION, "--json"])
+
+    assert result.exit_code == 1, result.output
+    assert "No MWAA environment" in result.output
+
+
+def test_airflow_trigger_confirms_and_triggers_with_yes(monkeypatch):
+    ctx = AwsContext("mock-dev", REGION, None, None, None, None)
+    seen = {}
+
+    def fake_trigger(_ctx, env, dag, conf=None, logical_date=None):
+        seen["env"] = env
+        seen["dag"] = dag
+        seen["conf"] = conf
+        return _airflow_run_view(dag_id=dag, run_id="manual__triggered")
+
+    monkeypatch.setattr(cli_module, "build_contexts", lambda *_a, **_k: [ctx])
+    monkeypatch.setattr(cli_module, "trigger_airflow_dag", fake_trigger)
+
+    result = runner.invoke(
+        app,
+        [
+            "airflow",
+            "trigger",
+            "--dag",
+            "avm_end_to_end",
+            "--env",
+            "u-airflow2",
+            "--region",
+            REGION,
+            "--conf",
+            '{"run_date": "2026-01-01"}',
+            "--yes",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["dag_run"]["dag_run_id"] == "manual__triggered"
+    assert seen["conf"] == {"run_date": "2026-01-01"}
+
+
+def test_airflow_trigger_aborts_when_not_confirmed(monkeypatch):
+    ctx = AwsContext("mock-dev", REGION, None, None, None, None)
+    called = {"triggered": False}
+
+    def fake_trigger(*_a, **_k):
+        called["triggered"] = True
+        return _airflow_run_view()
+
+    monkeypatch.setattr(cli_module, "build_contexts", lambda *_a, **_k: [ctx])
+    monkeypatch.setattr(cli_module, "trigger_airflow_dag", fake_trigger)
+
+    result = runner.invoke(
+        app,
+        ["airflow", "trigger", "--dag", "avm_end_to_end", "--env", "u-airflow2", "--region", REGION],
+        input="n\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Aborted" in result.output
+    assert called["triggered"] is False
+
+
+def test_airflow_trigger_json_requires_yes(monkeypatch):
+    ctx = AwsContext("mock-dev", REGION, None, None, None, None)
+    monkeypatch.setattr(cli_module, "build_contexts", lambda *_a, **_k: [ctx])
+
+    result = runner.invoke(
+        app,
+        ["airflow", "trigger", "--dag", "avm_end_to_end", "--env", "u-airflow2", "--region", REGION, "--json"],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "--yes" in result.output
+
+
+def test_smops_default_mwaa_env_config_round_trip(monkeypatch, tmp_path):
+    config_file = tmp_path / "smops-config.json"
+    monkeypatch.setenv("SMOPS_CONFIG_FILE", str(config_file))
+    monkeypatch.delenv("SMOPS_MWAA_ENVIRONMENT", raising=False)
+
+    set_result = runner.invoke(app, ["config", "set-mwaa-env", "u-airflow2", "--json"])
+    assert set_result.exit_code == 0, set_result.output
+    assert json.loads(set_result.output)["mwaa_environment"] == "u-airflow2"
+
+    get_result = runner.invoke(app, ["config", "get-mwaa-env", "--json"])
+    assert get_result.exit_code == 0, get_result.output
+    assert json.loads(get_result.output)["mwaa_environment"] == "u-airflow2"
+
+
+def test_smops_tui_home_selects_airflow_view():
+    async def run_app() -> None:
+        app_under_test = SmopsTuiApp()
+        async with app_under_test.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            table = app_under_test.query_one("#home", DataTable)
+            assert table.row_count == 4
+            await pilot.press("down")
+            await pilot.press("down")
+            await pilot.press("down")
+            await pilot.press("enter")
+            assert app_under_test.return_value == "airflow"
+
+    asyncio.run(run_app())
+
+
+def test_airflow_tui_shows_dags(monkeypatch):
+    ctx = AwsContext("mock-dev", REGION, None, None, None, None)
+    monkeypatch.setattr(tui_module, "build_contexts", lambda *_a, **_k: [ctx])
+    monkeypatch.setattr(tui_module, "list_airflow_dags", lambda _ctx, _env: [_airflow_dag_view()])
+    monkeypatch.setattr(tui_module, "list_airflow_pools", lambda _ctx, _env: [
+        AirflowPoolView("mock-dev", REGION, "u-airflow2", "default_pool", 10000, 20, 0, 20, 9980)
+    ])
+    monkeypatch.setattr(tui_module, "list_airflow_dag_runs", lambda _ctx, _env, _dag: [_airflow_run_view()])
+
+    async def run_app() -> None:
+        app_under_test = AirflowApp(("mock-dev",), REGION, False, 60, "u-airflow2")
+        async with app_under_test.run_test(size=(160, 50)) as pilot:
+            await pilot.pause()
+            dags = app_under_test.query_one("#airflow-dags", DataTable)
+            assert dags.row_count == 1
+            assert app_under_test.selected_dag().dag_id == "avm_end_to_end"
+
+    asyncio.run(run_app())
+
+
+def test_airflow_tui_still_shows_dags_when_pools_forbidden(monkeypatch):
+    # A role that can read DAGs may still get 403 on pools; the DAG view must survive.
+    ctx = AwsContext("mock-dev", REGION, None, None, None, None)
+    monkeypatch.setattr(tui_module, "build_contexts", lambda *_a, **_k: [ctx])
+    monkeypatch.setattr(tui_module, "list_airflow_dags", lambda _ctx, _env: [_airflow_dag_view()])
+    monkeypatch.setattr(tui_module, "list_airflow_dag_runs", lambda _ctx, _env, _dag: [_airflow_run_view()])
+
+    def forbidden_pools(_ctx, _env):
+        raise AwsCliError("Airflow API GET pools 返回 403: Forbidden")
+
+    monkeypatch.setattr(tui_module, "list_airflow_pools", forbidden_pools)
+
+    async def run_app() -> None:
+        app_under_test = AirflowApp(("mock-dev",), REGION, False, 60, "u-airflow2")
+        async with app_under_test.run_test(size=(160, 50)) as pilot:
+            await pilot.pause()
+            dags = app_under_test.query_one("#airflow-dags", DataTable)
+            assert dags.row_count == 1
+            assert app_under_test.selected_dag().dag_id == "avm_end_to_end"
+            assert app_under_test.pools == []
+            assert "403" in (app_under_test.pools_error or "")
+
+    asyncio.run(run_app())
+
+
+def test_fuzzy_filter_dags_matches_subsequence_and_ranks():
+    from sagemaker_ops.tui import _fuzzy_filter_dags
+
+    dags = [
+        _airflow_dag_view("avm_end_to_end"),
+        _airflow_dag_view("avm_report"),
+        _airflow_dag_view("avm_move_data"),
+        _airflow_dag_view("svp_avm"),
+    ]
+
+    assert [d.dag_id for d in _fuzzy_filter_dags(dags, "endto")] == ["avm_end_to_end"]
+    assert [d.dag_id for d in _fuzzy_filter_dags(dags, "avmre")] == ["avm_report"]
+    assert _fuzzy_filter_dags(dags, "zzz") == []
+    # Empty query returns everything, unranked (original order).
+    assert len(_fuzzy_filter_dags(dags, "")) == 4
+
+
+def test_airflow_tui_search_filters_and_jumps(monkeypatch):
+    ctx = AwsContext("mock-dev", REGION, None, None, None, None)
+    dags = [
+        _airflow_dag_view("avm_report"),
+        _airflow_dag_view("avm_move_data"),
+        _airflow_dag_view("avm_end_to_end"),
+    ]
+    monkeypatch.setattr(tui_module, "build_contexts", lambda *_a, **_k: [ctx])
+    monkeypatch.setattr(tui_module, "list_airflow_dags", lambda _ctx, _env: dags)
+    monkeypatch.setattr(tui_module, "list_airflow_pools", lambda _ctx, _env: [])
+    monkeypatch.setattr(tui_module, "list_airflow_dag_runs", lambda _ctx, _env, _dag: [])
+
+    async def run_app() -> None:
+        app_under_test = AirflowApp(("mock-dev",), REGION, False, 60, "u-airflow2")
+        async with app_under_test.run_test(size=(160, 50)) as pilot:
+            await pilot.pause()
+            table = app_under_test.query_one("#airflow-dags", DataTable)
+            assert table.row_count == 3
+
+            await pilot.press("slash")
+            await pilot.pause()
+            assert app_under_test.searching is True
+
+            for key in ["e", "n", "d", "t", "o"]:
+                await pilot.press(key)
+            await pilot.pause()
+            assert table.row_count == 1
+            assert app_under_test.selected_dag().dag_id == "avm_end_to_end"
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app_under_test.searching is False
+            assert app_under_test.selected_dag().dag_id == "avm_end_to_end"
+
+            # Escape clears the filter and restores the full list.
+            await pilot.press("slash")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app_under_test.search_query == ""
+            assert table.row_count == 3
+
+    asyncio.run(run_app())
+
+
+def test_airflow_tui_refresh_preserves_run_selection_and_task_view(monkeypatch):
+    ctx = AwsContext("mock-dev", REGION, None, None, None, None)
+    runs = [
+        _airflow_run_view(run_id="manual__newest"),
+        _airflow_run_view(run_id="manual__older"),
+    ]
+    tasks = [
+        AirflowTaskInstanceView(
+            "mock-dev", REGION, "u-airflow2", "avm_end_to_end", "manual__older",
+            "get_date", "success", 1,
+            datetime(2026, 1, 1, tzinfo=timezone.utc), datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc), 60.0,
+        )
+    ]
+    monkeypatch.setattr(tui_module, "build_contexts", lambda *_a, **_k: [ctx])
+    monkeypatch.setattr(tui_module, "list_airflow_dags", lambda _ctx, _env: [_airflow_dag_view()])
+    monkeypatch.setattr(tui_module, "list_airflow_pools", lambda _ctx, _env: [])
+    monkeypatch.setattr(tui_module, "list_airflow_dag_runs", lambda _ctx, _env, _dag: runs)
+    monkeypatch.setattr(tui_module, "list_airflow_task_instances", lambda _ctx, _env, _dag, _run: tasks)
+
+    async def run_app() -> None:
+        app_under_test = AirflowApp(("mock-dev",), REGION, False, 60, "u-airflow2")
+        async with app_under_test.run_test(size=(160, 50)) as pilot:
+            await pilot.pause()
+            runs_table = app_under_test.query_one("#airflow-runs", DataTable)
+            assert runs_table.row_count == 2
+
+            # Select the second (older) run and load its task states.
+            runs_table.move_cursor(row=1)
+            assert app_under_test.selected_run().dag_run_id == "manual__older"
+            app_under_test.action_load_tasks()
+            await pilot.pause()
+            assert app_under_test._tasks_view_key == ("avm_end_to_end", "manual__older")
+
+            # A periodic refresh must keep the older run selected and stay in the
+            # task view rather than jumping to the newest run and the pools pane.
+            app_under_test.action_refresh()
+            await pilot.pause()
+            assert app_under_test.selected_run().dag_run_id == "manual__older"
+            assert app_under_test._tasks_view_key == ("avm_end_to_end", "manual__older")
 
     asyncio.run(run_app())
