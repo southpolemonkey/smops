@@ -35,7 +35,7 @@ pip install git+https://github.com/southpolemonkey/smops.git
 Install from a local wheel:
 
 ```bash
-pip install dist/sagemaker_ops_cli-0.3.0-py3-none-any.whl
+pip install dist/sagemaker_ops_cli-0.2.0-py3-none-any.whl
 ```
 
 Install with Homebrew:
@@ -98,8 +98,8 @@ python -m build
 
 Build artifacts are written to `dist/`:
 
-- `sagemaker_ops_cli-0.3.0-py3-none-any.whl`
-- `sagemaker_ops_cli-0.3.0.tar.gz`
+- `sagemaker_ops_cli-0.2.0-py3-none-any.whl`
+- `sagemaker_ops_cli-0.2.0.tar.gz`
 
 ## Submit A Processing Job
 
