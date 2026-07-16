@@ -949,18 +949,14 @@ def test_processing_tui_loads_selected_job_logs(monkeypatch, sagemaker_client, l
 def test_pipeline_tui_shows_loading_state_before_refresh_finishes(monkeypatch):
     import threading
 
-    # The worker blocks on this event so the "loading" status is still showing
-    # when we read it. We set it after the assertion so the app can shut down cleanly.
+    # worker_started fires when build_contexts is called (worker is running).
+    # proceed fires after the assertion to unblock the worker so the app can exit.
+    worker_started = threading.Event()
     proceed = threading.Event()
-    call_count = {"n": 0}
 
     def blocking_build_contexts(*_args, **_kwargs):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            # Block only the first (mount-triggered) refresh so we can assert on
-            # the loading state. Subsequent calls (e.g. from the interval) return
-            # immediately so the app can shut down without hanging.
-            proceed.wait(timeout=5)
+        worker_started.set()
+        proceed.wait(timeout=5)
         return []
 
     monkeypatch.setattr(tui_module, "build_contexts", blocking_build_contexts)
@@ -968,13 +964,12 @@ def test_pipeline_tui_shows_loading_state_before_refresh_finishes(monkeypatch):
     async def run_app() -> None:
         app_under_test = PipelineExecutionsApp(("mock-dev",), REGION, False, 60, "slow-pipeline")
         async with app_under_test.run_test(size=(140, 40)) as pilot:
-            # A very short pause — enough for on_mount to post the worker but not
-            # for the blocked worker thread to complete.
-            await pilot.pause(0.01)
+            # Wait (non-blocking to event loop) until the worker thread is running.
+            while not worker_started.is_set():
+                await pilot.pause(0.01)
             status = app_under_test.query_one("#status", Static).content
             assert "Loading pipeline executions" in str(status)
             proceed.set()
-            # Let the worker finish before exiting.
             await pilot.pause()
 
     asyncio.run(run_app())
